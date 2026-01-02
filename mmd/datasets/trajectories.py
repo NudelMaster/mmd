@@ -2,6 +2,7 @@
 From https://github.com/jacarvalho/mpd-public
 """
 import abc
+import inspect
 import os.path
 
 import git
@@ -28,6 +29,7 @@ class TrajectoryDatasetBase(Dataset, abc.ABC):
                  normalizer='LimitsNormalizer',
                  use_extra_objects=False,
                  obstacle_cutoff_margin=None,
+                 env_scale=None,
                  tensor_args=None,
                  **kwargs):
 
@@ -46,7 +48,17 @@ class TrajectoryDatasetBase(Dataset, abc.ABC):
         # Environment
         env_class = getattr(
             environments, self.metadata['env_id'] + 'ExtraObjects' if use_extra_objects else self.metadata['env_id'])
-        self.env = env_class(tensor_args=tensor_args)
+        
+        # Build environment kwargs with priority chain: runtime param > args.yaml > default
+        env_kwargs = {'tensor_args': tensor_args}
+        
+        # Check if environment supports scale parameter
+        if 'scale' in inspect.signature(env_class.__init__).parameters:
+            # Priority: env_scale parameter > args['env_scale'] > default 1.0
+            scale_value = env_scale if env_scale is not None else self.args.get('env_scale', 1.0)
+            env_kwargs['scale'] = scale_value
+        
+        self.env = env_class(**env_kwargs)
 
         # Robot
         robot_class = getattr(robots, self.metadata['robot_id'])
@@ -71,10 +83,10 @@ class TrajectoryDatasetBase(Dataset, abc.ABC):
 
         # dimensions
         b, h, d = self.dataset_shape = self.fields[self.field_key_traj].shape
-        self.n_trajs = b
-        self.n_support_points = h
+        self.n_trajs = b # number of trajectories
+        self.n_support_points = h # horizon
         self.state_dim = d  # state dimension used for the diffusion model
-        self.trajectory_dim = (self.n_support_points, d)
+        self.trajectory_dim = (self.n_support_points, d) # each trajectory is of shape (horizon, state_dim)
 
         # normalize the data (for the diffusion model)
         self.normalizer = DatasetNormalizer(self.fields, normalizer=normalizer)

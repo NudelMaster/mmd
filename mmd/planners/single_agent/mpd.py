@@ -84,6 +84,7 @@ class MPD(SingleAgentPlanner):
                  n_samples: int,
                  n_local_inference_noising_steps: int,
                  n_local_inference_denoising_steps: int,
+                 env_scale: float = None,
                  **kwargs
                  ):
         super().__init__()
@@ -125,6 +126,7 @@ class MPD(SingleAgentPlanner):
             dataset_class='TrajectoryDataset',
             use_extra_objects=True,
             obstacle_cutoff_margin=0.05,
+            env_scale=env_scale,
             **args,
             tensor_args=tensor_args
         )

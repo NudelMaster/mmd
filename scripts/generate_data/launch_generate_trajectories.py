@@ -12,11 +12,11 @@ from experiment_launcher.utils import is_local
 # num_contexts: the number of start/goal pairs.
 # num_trajectories_per_context: the number of trajectories per start/goal pair.
 
-env_id: str = 'EnvHighways2D'
+env_id: str = 'EnvDropRegion2D'
 robot_id: str = 'RobotPlanarDisk'
-num_contexts = 500
+num_contexts = 10  # Reduced for testing - increase to 500 later
 num_trajectories_per_context = 20
-threshold_start_goal_pos: float = 0.9
+threshold_start_goal_pos: float = 0.5
 is_start_goal_near_limits: bool = False
 obstacle_cutoff_margin: float = 0.05
 
@@ -25,7 +25,7 @@ obstacle_cutoff_margin: float = 0.05
 
 hostname = socket.gethostname()
 
-LOCAL = is_local()
+LOCAL = True  # Force local execution
 TEST = False
 # USE_CUDA = True
 USE_CUDA = False

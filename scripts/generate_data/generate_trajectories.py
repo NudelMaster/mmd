@@ -705,8 +705,8 @@ def generate_linear_trajectories(
 def experiment(
     # env_id: str = 'EnvEmptyNoWait2D',
     # env_id: str = 'EnvEmpty2D',
-    # env_id: str = 'EnvDropRegion2D',
-    env_id: str = 'EnvHighways2D',
+    env_id: str = 'EnvDropRegion2D',
+    # env_id: str = 'EnvHighways2D',
     # env_id: str = 'EnvConveyor2D',
 
     robot_id: str = 'RobotPlanarDisk',

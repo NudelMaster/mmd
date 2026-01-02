@@ -14,26 +14,27 @@ class EnvEmpty2DExtraObjects(EnvEmpty2D):
 
     def __init__(self, tensor_args=None, **kwargs):
         obj_extra_list = [
-            MultiSphereField(
-                # np.array([[0.5, 0.5]]),  # (n, 2) array of sphere centers.
-                np.array([]),  # (n, 2) array of sphere centers.
-                # np.array([.04]),  # (n, ) array of sphere radii.
-                np.array([]),  # (n, ) array of sphere radii.
-                tensor_args=tensor_args
-            ),
-            # MultiBoxField(
-            #     np.array(  # (n, 2) array of box centers.
-            #         [
-            #             [0.0, -0.2],
-            #         ]
-            #     ),
-            #     np.array(  # (n, 2) array of box sizes.
-            #         [
-            #             [0.4, 0.39],
-            #         ]
-            #     ),
+            # MultiSphereField(
+            #     # Large obstacles in the middle - more challenging navigation
+            #     np.array([[0.0, 0.0]]),  
+            #     np.array([0.3]),  # much larger spheres
             #     tensor_args=tensor_args
-            # )
+            # ),
+            MultiBoxField(
+                np.array(  # (n, 2) array of box centers.
+                    [
+                        [0.0, 0.0], [0.0, 0.6], [0.0, -0.6],
+                    ]
+                ),
+                np.array(  # (n, 2) array of box sizes.
+                    [
+                        [0.2, 0.5],
+                        [0.2, 0.38],
+                        [0.2, 0.38],
+                    ]
+                ),
+                tensor_args=tensor_args
+            )
         ]
 
         super().__init__(
@@ -45,19 +46,33 @@ class EnvEmpty2DExtraObjects(EnvEmpty2D):
 
 
 if __name__ == '__main__':
+    import os
+    from pathlib import Path
+    
+    # Get mmd root directory and create media subdirectory
+    mmd_root = Path(__file__).resolve().parents[4]  # Navigate to /home/.../mmd/
+    output_dir = mmd_root / 'media'
+    output_dir.mkdir(exist_ok=True)
+    
     env = EnvEmpty2DExtraObjects(
         precompute_sdf_obj_fixed=True,
         sdf_cell_size=0.01,
         tensor_args=DEFAULT_TENSOR_ARGS
     )
+    
+    # Save environment rendering
     fig, ax = create_fig_and_axes(env.dim)
     env.render(ax)
-    plt.show()
+    output_path = output_dir / 'env_empty_2d_extra_objects.png'
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    print(f"Saved: {output_path}")
+    plt.close()
 
-    # Render sdf
+    # Save SDF and gradient
     fig, ax = create_fig_and_axes(env.dim)
     env.render_sdf(ax, fig)
-
-    # Render gradient of sdf
     env.render_grad_sdf(ax, fig)
-    plt.show()
+    output_path = output_dir / 'env_empty_2d_sdf_gradient.png'
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    print(f"Saved: {output_path}")
+    plt.close()

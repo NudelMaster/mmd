@@ -24,6 +24,7 @@ SOFTWARE.
 # Standard imports.
 # from torch_robotics.isaac_gym_envs.motion_planning_envs import PandaMotionPlanningIsaacGymEnv, MotionPlanningController
 
+import inspect
 import os
 import pickle
 from datetime import datetime
@@ -71,8 +72,12 @@ from mmd.common.experiments import MultiAgentPlanningSingleTrialConfig, MultiAge
 from torch_robotics.environments import *
 
 allow_ops_in_compiled_graph()
+from pathlib import Path
+BASE = Path(__file__).resolve().parents[2]   # repo root (scripts/inference -> scripts -> repo)
+TRAINED_MODELS_DIR = str(BASE / 'data_trained_models')
+print(f"DEBUG: TRAINED_MODELS_DIR = {TRAINED_MODELS_DIR}")
+print(f"DEBUG: Path exists? {os.path.exists(TRAINED_MODELS_DIR)}")
 
-TRAINED_MODELS_DIR = '../../data_trained_models/'
 device = 'cuda'
 device = get_torch_device(device)
 tensor_args = {'device': device, 'dtype': torch.float32}
@@ -107,6 +112,7 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
         'seed': params.seed,
         'results_dir': params.results_dir,
         'trained_models_dir': TRAINED_MODELS_DIR,
+        'env_scale': test_config.env_scale,
     }
     high_level_planner_model_args = {
         'is_xcbs': True if test_config.multi_agent_planner_class in ["XECBS", "XCBS"] else False,
@@ -137,6 +143,7 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
     # ============================
     # Create a reference planner from which we'll use the task and robot as the reference on in CBS.
     # Those are used for collision checking and visualization. This has a skeleton of all tiles.
+    # For single tile it would just be [[0, 0]]
     reference_agent_skeleton = [[r, c] for r in range(len(global_model_ids))
                                 for c in range(len(global_model_ids[0]))]
 
@@ -224,6 +231,7 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
     # ============================
     planners_creation_start_time = time.time()
     low_level_planner_l = []
+    # for each agent create a low level planner referencing its own data/models.
     for i in range(num_agents):
         low_level_planner_model_args_i = low_level_planner_model_args.copy()
         low_level_planner_model_args_i['start_state_pos'] = start_l[i]
@@ -233,12 +241,13 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
         if test_config.single_agent_planner_class == "MPD":
             # Set the model_id to the first one.
             low_level_planner_model_args_i['model_id'] = agent_model_ids_l[i][0]
+        # actual creation and appending it to the list of planners.
         low_level_planner_l.append(low_level_planner_class(**low_level_planner_model_args_i))
     print('Planners creation time:', time.time() - planners_creation_start_time)
     print("\n\n\n\n")
 
     # ============================
-    # Create the multi agent planner.
+    # Create the multi agent planner (high level planner).
     # ============================
     if (test_config.multi_agent_planner_class in ["XECBS", "ECBS", "XCBS", "CBS"]):
         multi_agent_planner_class = CBS
@@ -256,6 +265,10 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
     # Plan.
     # ============================
     startt = time.time()
+    # path_l: list of per-agent trajectories. Each trajectory is of shape (H, state_dim).
+    # num_ct_expansions: number of CT nodes expanded.
+    # trial_success_status: whether the trial was successful.
+    # num_collisions_in_solution: number of collisions in the initial solution (0 if successful).
     paths_l, num_ct_expansions, trial_success_status, num_collisions_in_solution = \
         planner.plan(runtime_limit=test_config.runtime_limit)
     planning_time = time.time() - startt
@@ -313,7 +326,11 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
                                              agent_model_transform)
                 model_env_name = agent_model_id.split('-')[0]
                 kwargs = {'tensor_args': tensor_args}
-                env_object = eval(model_env_name)(**kwargs)
+                # Get the environment class and check if it supports scale parameter
+                env_class = eval(model_env_name)
+                if 'scale' in inspect.signature(env_class.__init__).parameters and test_config.env_scale is not None:
+                    kwargs['scale'] = test_config.env_scale
+                env_object = env_class(**kwargs)
                 agent_data_adherence += env_object.compute_traj_data_adherence(agent_path_in_model_frame)
             agent_data_adherence /= len(agent_model_ids_l[agent_id])
             single_trial_result.data_adherence += agent_data_adherence
@@ -372,8 +389,8 @@ if __name__ == '__main__':
     test_config_single_tile.instance_name = "test"
     test_config_single_tile.multi_agent_planner_class = "XECBS"  # Or "ECBS" or "XCBS" or "CBS" or "PP".
     test_config_single_tile.single_agent_planner_class = "MPDEnsemble"  # Or "MPD"
-    test_config_single_tile.stagger_start_time_dt = 0
-    test_config_single_tile.runtime_limit = 60 * 3  # 3 minutes.
+    test_config_single_tile.stagger_start_time_dt = 5
+    test_config_single_tile.runtime_limit = 60 * 3 # 3 minutes.
     test_config_single_tile.time_str = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     test_config_single_tile.render_animation = True  # Change the `densify_trajs` call above to create nicer animations.
 
@@ -384,28 +401,38 @@ if __name__ == '__main__':
     # ============================
     if example_type == "single_tile":
         # Choose the model to use. A model is for a map/robot combination.
-        # test_config_single_tile.global_model_ids = [['EnvEmpty2D-RobotPlanarDisk']]
-        test_config_single_tile.global_model_ids = [['EnvEmptyNoWait2D-RobotPlanarDisk']]
-        # test_config_single_tile.global_model_ids = [['EnvConveyor2D-RobotPlanarDisk']]
-        # test_config_single_tile.global_model_ids = [['EnvHighways2D-RobotPlanarDisk']]
-        # test_config_single_tile.global_model_ids = [['EnvDropRegion2D-RobotPlanarDisk']]
+        #test_config_single_tile.global_model_ids = [['EnvEmpty2D-RobotPlanarDisk']]
+        #test_config_single_tile.global_model_ids = [['EnvEmptyNoWait2D-RobotPlanarDisk']]
+        #test_config_single_tile.global_model_ids = [['EnvConveyor2D-RobotPlanarDisk']]
+        test_config_single_tile.global_model_ids = [['EnvHighways2D-RobotPlanarDisk']]
+        #test_config_single_tile.global_model_ids = [['EnvDropRegion2D-RobotPlanarDisk']]
 
         # Choose starts and goals.
         test_config_single_tile.agent_skeleton_l = [[[0, 0]]] * test_config_single_tile.num_agents
         torch.random.manual_seed(10)
         test_config_single_tile.start_state_pos_l, test_config_single_tile.goal_state_pos_l = \
-        get_start_goal_pos_circle(test_config_single_tile.num_agents, 0.8)
-        # Another option is to get random starts and goals.
-        # get_start_goal_pos_random_in_env(test_config_single_tile.num_agents,
-        #                                  EnvDropRegion2D,
-        #                                  tensor_args,
-        #                                  margin=0.2,
-        #                                  obstacle_margin=0.11)
+        get_start_goal_pos_random_in_env(test_config_single_tile.num_agents,
+                                         EnvHighways2D,
+                                         tensor_args,
+                                         margin=0.2,
+                                         obstacle_margin=0.05)
+        
+        # (torch.tensor([[-0.25, -0.5],
+        #                [ 0,  -0.5],
+        #                [ 0.25, -0.5]], **tensor_args),
+        #  torch.tensor([[0, 0.5],
+        #                 [0.5, 0.5],
+        #                 [0.75, 0.5]], **tensor_args)
+        # )
+        
+        #get_start_goal_pos_circle(test_config_single_tile.num_agents, 0.6)
+        
+        #Another option is to get random starts and goals.
+        
         # A third option is to get starts and goals in a "boundary" formation.
         # get_start_goal_pos_boundary(test_config_single_tile.num_agents, 0.85)
         # And a final option is to hard-code starts and goals.
-        # (torch.tensor([[-0.8, 0], [0.8, -0]], **tensor_args),
-        #  torch.tensor([[0.8, -0], [-0.8, 0]], **tensor_args))
+        
         print("Starts:", test_config_single_tile.start_state_pos_l)
         print("Goals:", test_config_single_tile.goal_state_pos_l)
 
@@ -417,7 +444,7 @@ if __name__ == '__main__':
     # ============================
     if example_type == "multi_tile":
         test_config_multiple_tiles = test_config_single_tile
-        test_config_multiple_tiles.num_agents = 4
+        test_config_multiple_tiles.num_agents = 3
         test_config_multiple_tiles.stagger_start_time_dt = 5
         test_config_multiple_tiles.global_model_ids = \
             [['EnvEmptyNoWait2D-RobotPlanarDisk', 'EnvEmptyNoWait2D-RobotPlanarDisk']]

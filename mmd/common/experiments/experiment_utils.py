@@ -64,6 +64,7 @@ def read_aggregated_trial_results_for_experiment(experiment_config: MultiAgentPl
                 trial_config.num_agents = num_agents
                 trial_config.multi_agent_planner_class = multi_agent_planner_class
                 trial_config.single_agent_planner_class = experiment_config.single_agent_planner_class
+                trial_config.env_scale = experiment_config.env_scale
                 results_dir = get_result_dir_from_trial_config(trial_config,
                                                                time_str=experiment_config.time_str,
                                                                trial_number=trial_number)

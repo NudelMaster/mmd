@@ -59,7 +59,9 @@ from mmd.common.experiences import PathExperience, PathBatchExperience
 from mmd.common.constraints import MultiPointConstraint
 from mmd.common.pretty_print import *
 
-TRAINED_MODELS_DIR = '../../data_trained_models/'
+# Construct absolute path to data_trained_models
+BASE = Path(__file__).resolve().parents[3]  # mmd/planners/single_agent -> mmd/planners -> mmd -> repo
+TRAINED_MODELS_DIR = str(BASE / 'data_trained_models')
 
 
 class MPDEnsemble(SingleAgentPlanner):
@@ -92,6 +94,7 @@ class MPDEnsemble(SingleAgentPlanner):
                  n_samples: int,
                  n_local_inference_noising_steps: int,
                  n_local_inference_denoising_steps: int,
+                 env_scale: float = None,
                  **kwargs
                  ):
         super().__init__()
@@ -137,6 +140,7 @@ class MPDEnsemble(SingleAgentPlanner):
                 dataset_class='TrajectoryDataset',
                 use_extra_objects=True,
                 obstacle_cutoff_margin=0.01,
+                env_scale=env_scale,
                 **args[-1],
                 tensor_args=tensor_args
             )

@@ -65,7 +65,7 @@ class RobotPlanarDisk(RobotBase):
             name=name,
             q_limits=to_torch(q_limits, **kwargs['tensor_args']),
             link_names_for_object_collision_checking=['link_0'],
-            link_margins_for_object_collision_checking=[radius * 1.1],
+            link_margins_for_object_collision_checking=[radius * 1.1], 
             link_idxs_for_object_collision_checking=[0],
             num_interpolated_points_for_object_collision_checking=1,
             **kwargs

@@ -42,6 +42,7 @@ class EnvHighways2D(EnvBase):
                  tensor_args=None,
                  precompute_sdf_obj_fixed=True,
                  sdf_cell_size=0.005,
+                 scale=1.0,
                  **kwargs
                  ):
 
@@ -64,7 +65,7 @@ class EnvHighways2D(EnvBase):
                     [-0.875, -0.875],
                 ]),
                 np.array([
-                    [0.5, 0.5],
+                    [0.5  * scale, 0.5  * scale],
                     [0.5, 0.25],
                     [0.5, 0.25],
                     [0.25, 0.5],
@@ -98,6 +99,7 @@ class EnvHighways2D(EnvBase):
             precompute_sdf_obj_fixed=precompute_sdf_obj_fixed,
             sdf_cell_size=sdf_cell_size,
             tensor_args=tensor_args,
+            scale=scale,
             **kwargs
         )
 
@@ -273,19 +275,50 @@ class EnvHighways2D(EnvBase):
         return 1 if aggregate_cross_product > 0 else 0
 
 if __name__ == '__main__':
+
+    from pathlib import Path
+    
+    # Get mmd root directory and create media subdirectory
+    mmd_root = Path(__file__).resolve().parents[4]  # Navigate to /home/.../mmd/
+    output_dir = mmd_root / 'media'
+    output_dir.mkdir(exist_ok=True)
+    scale = 1.75
     env = EnvHighways2D(
         precompute_sdf_obj_fixed=True,
         sdf_cell_size=0.01,
-        tensor_args=DEFAULT_TENSOR_ARGS
+        tensor_args=DEFAULT_TENSOR_ARGS,
+        scale=scale
     )
+    print(f"Scaled extra objects by factor {scale}.")
+    # Save environment rendering
     fig, ax = create_fig_and_axes(env.dim)
     env.render(ax)
-    plt.show()
+    output_path = output_dir / 'env_highways_2d.png'
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    print(f"Saved: {output_path}")
+    plt.close()
 
-    # Render sdf
+    # Save SDF and gradient
     fig, ax = create_fig_and_axes(env.dim)
     env.render_sdf(ax, fig)
-
-    # Render gradient of sdf
     env.render_grad_sdf(ax, fig)
-    plt.show()
+    output_path = output_dir / 'env_highways_2d_sdf_gradient.png'
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    print(f"Saved: {output_path}")
+    plt.close()
+    # env = EnvHighways2D(
+    #     precompute_sdf_obj_fixed=True,
+    #     sdf_cell_size=0.01,
+    #     tensor_args=DEFAULT_TENSOR_ARGS
+    # )
+    # fig, ax = create_fig_and_axes(env.dim)
+    # env.render(ax)
+    # plt.show()
+
+    # # Render sdf
+    # fig, ax = create_fig_and_axes(env.dim)
+    # env.render_sdf(ax, fig)
+
+    # # Render gradient of sdf
+    # env.render_grad_sdf(ax, fig)
+    # plt.show()

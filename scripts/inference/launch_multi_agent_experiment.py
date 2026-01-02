@@ -51,7 +51,7 @@ def run_multi_agent_experiment(experiment_config: MultiAgentPlanningExperimentCo
                 f.write("This is for single_trial_config: ")
                 f.write(str(single_trial_config))
                 f.write("\n")
-            continue
+            break
 
     # Print the runtime.
     print("Runtime: ", time.time() - startt)
@@ -64,17 +64,17 @@ if __name__ == "__main__":
     # Create an experiment config.
     experiment_config = MultiAgentPlanningExperimentConfig()
     # Set the experiment config.
-    experiment_config.num_agents_l = [2, 3, 6]
+    experiment_config.num_agents_l = [3]
 
     # Single tile.
     # experiment_config.instance_name = "EnvEmpty2DRobotPlanarDiskCircle"
     # experiment_config.instance_name = "EnvEmpty2DRobotPlanarDiskBoundary"
     # experiment_config.instance_name = "EnvConveyor2DRobotPlanarDiskBoundary"
-    # experiment_config.instance_name = "EnvHighways2DRobotPlanarDiskSmallCircle"
+    #experiment_config.instance_name = "EnvHighways2DRobotPlanarDiskSmallCircle"
     # experiment_config.instance_name = "EnvDropRegion2DRobotPlanarDiskBoundary"
-    # experiment_config.instance_name = "EnvConveyor2DRobotPlanarDiskRandom"
+    experiment_config.instance_name = "EnvConveyor2DRobotPlanarDiskRandom"
     # experiment_config.instance_name = "EnvEmpty2DRobotPlanarDiskRandom"
-    experiment_config.instance_name = "EnvHighways2DRobotPlanarDiskRandom"
+    #experiment_config.instance_name = "EnvHighways2DRobotPlanarDiskRandom"
 
     # Multiple tiles.
     # experiment_config.instance_name = "EnvTestTwoByTwoRobotPlanarDiskRandom"
@@ -87,6 +87,7 @@ if __name__ == "__main__":
     experiment_config.runtime_limit = 60 * 3
     experiment_config.num_trials_per_combination = 1
     experiment_config.render_animation = True
+    experiment_config.env_scale = 1.3  # Set to desired scale factor (e.g., 1.25 for 1.25x scaling)
     # Run the experiment.
     run_multi_agent_experiment(experiment_config)
 

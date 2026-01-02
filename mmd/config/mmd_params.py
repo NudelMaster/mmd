@@ -29,7 +29,7 @@ class MMDParams:
     # Robot parameters.
     robot_planar_disk_radius = 0.05
     # Single-agent planning parameters.
-    use_guide_on_extra_objects_only = False
+    use_guide_on_extra_objects_only = False # was False originally
     n_samples = 64  # Batch size. Number of trajectories generated together.
     horizon = 64  # Number of steps in the trajectory.
     n_local_inference_noising_steps = 3  # Number of noising steps in local inference.
@@ -40,7 +40,7 @@ class MMDParams:
     weight_grad_cost_collision = 2e-2
     weight_grad_cost_smoothness = 8e-2
     weight_grad_cost_constraints = 2e-1
-    weight_grad_cost_soft_constraints = 2e-2
+    weight_grad_cost_soft_constraints = 2e-2 # changed from 2e-2 to 4e-2
     factor_num_interpolated_points_for_collision = 1.5
     trajectory_duration = 5.0
     device = 'cuda'

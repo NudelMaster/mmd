@@ -75,6 +75,8 @@ class SearchState:
     def update_g_l2(self):
         """
         Update the cost to reach this node.
+        Chooses best trajectry in the batch using the indexes in ix_best_path_in_batch_l.
+        Computes the total L2 length of the chosen trajectory.
         """
         self.g = 0
         for i, ix_best_path_in_batch in enumerate(self.ix_best_path_in_batch_l):
@@ -319,6 +321,8 @@ class CBS:
             if self.is_ecbs:
                 soft_constraint_l = self.create_soft_constraints_from_other_agents_paths(root, agent_id=i)
 
+            # Expecting to get a batch of candidate trajectories, indices of collision free trajectories,
+            # and the index of the best trajectory.
             planner_output = self.low_level_planner_l[i](self.start_state_pos_l[i],
                                                          self.goal_state_pos_l[i],
                                                          constraints_l=soft_constraint_l)
@@ -330,6 +334,7 @@ class CBS:
                 break
 
             # Update the root node.
+            # Using the best trajectory index, store in root node for further processing.
             ix_best_traj = planner_output.idx_best_traj
             root.path_bl.append(planner_output.trajs_final)
             root.ix_best_path_in_batch_l.append(ix_best_traj)
@@ -361,6 +366,7 @@ class CBS:
                 break
 
             # Sort the CT.
+            # Uses the number of conflicts as the cost instead as in Vanilla, can chanage it since x.g is computed.
             # Optionally replace the line below with `self.open_l.sort(key=lambda x: x.g)` to optimize for cost.
             self.open_l.sort(key=lambda x: len(x.conflict_l))
             # Get the first node from the open list.

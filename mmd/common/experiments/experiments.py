@@ -64,6 +64,8 @@ class MultiAgentPlanningExperimentConfig:
     num_trials_per_combination = 1
     # Whether to render animation or not.
     render_animation = False
+    # Optional scale for environment extra objects (None uses default from args.yaml or 1.0)
+    env_scale: float = None
 
     def get_single_trial_configs_from_experiment_config(self):
         single_trial_configs = []
@@ -72,7 +74,7 @@ class MultiAgentPlanningExperimentConfig:
             start_state_pos_l_l, goal_state_pos_l_l, global_model_ids_l_l, agent_skeleton_l_l = [], [], [], []
             for _ in range(self.num_trials_per_combination):
                 start_state_pos_l, goal_state_pos_l, global_model_ids, agent_skeleton_l = get_planning_problem(
-                    self.instance_name, num_agents)
+                    self.instance_name, num_agents, env_scale=self.env_scale)  # ← Pass env_scale
                 start_state_pos_l_l.append(start_state_pos_l)
                 goal_state_pos_l_l.append(goal_state_pos_l)
                 global_model_ids_l_l.append(global_model_ids)
@@ -90,6 +92,7 @@ class MultiAgentPlanningExperimentConfig:
                     single_trial_config.instance_name = self.instance_name
                     single_trial_config.runtime_limit = self.runtime_limit
                     single_trial_config.render_animation = self.render_animation
+                    single_trial_config.env_scale = self.env_scale
                     single_trial_config.start_state_pos_l, single_trial_config.goal_state_pos_l, \
                         single_trial_config.global_model_ids, single_trial_config.agent_skeleton_l = \
                         start_state_pos_l_l[trial_number], goal_state_pos_l_l[trial_number], \
@@ -138,6 +141,8 @@ class MultiAgentPlanningSingleTrialConfig:
     render_animation = False
     # The environment(s) to use for the multi-agent planning.
     instance_name = ""
+    # Optional scale for environment extra objects (None uses default from args.yaml or 1.0)
+    env_scale: float = None
     # The starts and goals, models ids, and skeletons.
     start_state_pos_l = []
     goal_state_pos_l = []
@@ -264,8 +269,10 @@ def get_result_dir_from_trial_config(trial_config: MultiAgentPlanningSingleTrial
         raise ValueError("Time string must be provided.")
     results_dir = get_result_dir_from_time_str(time_str)
     # Create a results directory.
+    scale_str = 'default' if trial_config.env_scale is None else f"{trial_config.env_scale:.2f}"
     results_dir = os.path.join(results_dir,
                                f'instance_name___{trial_config.instance_name}',
+                               f'env_scale___{scale_str}',
                                f'num_agents___{trial_config.num_agents}',
                                f'planner___{trial_config.multi_agent_planner_class}',
                                f'single_agent_planner___{trial_config.single_agent_planner_class}',

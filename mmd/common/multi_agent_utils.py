@@ -184,38 +184,64 @@ def get_start_goal_pos_random_in_env(num_agents,
                                      env_class,
                                      tensor_args,
                                      margin=0.15,
-                                     obstacle_margin=0.16):  # 0.08
+                                     obstacle_margin=0.08,
+                                     env_scale: float = None,
+                                     max_attempts_per_point: int = 1000):
     # In this map, agents can be place anywhere with x y in [-0.9, 0.9]. As long as they are not too close to
     # each other.
+    import inspect
     start_state_pos_l = []
     goal_state_pos_l = []
 
-    # Get the obstacles in this map.
-    env = env_class(tensor_args=tensor_args)
-    # Get a distance field.
-    env_sdf = env.grid_map_sdf_obj_fixed
+    # Build kwargs for env instantiation with scale parameter
+    kwargs = {'tensor_args': tensor_args}
+    if 'scale' in inspect.signature(env_class.__init__).parameters and env_scale is not None:
+        kwargs['scale'] = env_scale
+        print(f"✓ SAMPLING: Using {env_class.__name__} with scale={env_scale}, margin={margin}, obstacle_margin={obstacle_margin}")
+    else:
+        print(f"✓ SAMPLING: Using {env_class.__name__} (no scaling), margin={margin}, obstacle_margin={obstacle_margin}")
+    
+    env = env_class(**kwargs)
+    
+    # Use precomputed SDF for fixed objects (which are now scaled)
+    # If precomputed SDF is not available, fall back to compute_sdf
+    if env.grid_map_sdf_obj_fixed is not None:
+        env_sdf = env.grid_map_sdf_obj_fixed
+    else:
+        env_sdf = env.compute_sdf
 
     # Get the starts. Get all of them together and then check if they are too close.
     for i in [0, 1]:
         # Start building the random state.
         random_state = None
-        while True:
+        attempts = 0
+        while attempts < max_attempts_per_point:
+            attempts += 1
             random_state = torch.rand(1, 2) * 1.9 - 0.95
             random_state = random_state.to(**tensor_args)
             # Check if the state is not in an obstacle.
             if torch.all(env_sdf(random_state) > obstacle_margin):
                 break
+        if attempts >= max_attempts_per_point:
+            raise RuntimeError(f"Failed to find valid {'start' if i == 0 else 'goal'} position after {max_attempts_per_point} attempts. "
+                             f"obstacle_margin={obstacle_margin}, scale={env_scale}")
+        
         # Now add more point. For each point, check if it is not too close to the previous points and not in an
         # obstacle.
         state_b = random_state
-        for _ in range(num_agents - 1):
-            while True:
+        for agent_idx in range(num_agents - 1):
+            attempts = 0
+            while attempts < max_attempts_per_point:
+                attempts += 1
                 new_state = torch.rand(1, 2) * 1.9 - 0.95
                 new_state = new_state.to(**tensor_args)
                 pairwise_distances = torch.sqrt(torch.sum((new_state - state_b) ** 2, dim=1))
                 # Check if the state is not in an obstacle.
                 if torch.all(env_sdf(new_state) > obstacle_margin) and torch.all(pairwise_distances > margin):
                     break
+            if attempts >= max_attempts_per_point:
+                raise RuntimeError(f"Failed to find valid {'start' if i == 0 else 'goal'} position for agent {agent_idx+1}/{num_agents} "
+                                 f"after {max_attempts_per_point} attempts. margin={margin}, obstacle_margin={obstacle_margin}, scale={env_scale}")
             state_b = torch.cat([state_b, new_state], dim=0)
         if i == 0:
             start_state_pos_l = [s for s in state_b]

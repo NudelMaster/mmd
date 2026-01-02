@@ -65,6 +65,7 @@ def get_dataset(dataset_class=None,
                 **kwargs):
     dataset_class = getattr(datasets, dataset_class)
     print('\n---------------Loading data')
+    print(f" Dataset directory: {dataset_subdir}")
     full_dataset = dataset_class(dataset_subdir=dataset_subdir, **kwargs)
     print(full_dataset)
 
