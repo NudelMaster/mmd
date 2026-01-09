@@ -95,6 +95,7 @@ class MPDEnsemble(SingleAgentPlanner):
                  n_local_inference_noising_steps: int,
                  n_local_inference_denoising_steps: int,
                  env_scale: float = None,
+                 horizon: int = None,
                  **kwargs
                  ):
         super().__init__()
@@ -146,7 +147,8 @@ class MPDEnsemble(SingleAgentPlanner):
             )
             dataset = train_subset.dataset
             datasets.append(dataset)
-            n_support_points = dataset.n_support_points
+            # Use override horizon if provided, otherwise use dataset's value
+            n_support_points = horizon if horizon is not None else dataset.n_support_points
             robot = dataset.robot
             if j == 0:
                 self.robot = robot

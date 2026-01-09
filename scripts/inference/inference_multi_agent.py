@@ -85,6 +85,15 @@ tensor_args = {'device': device, 'dtype': torch.float32}
 
 def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
     # ============================
+    # Apply hyperparameter overrides if provided.
+    # ============================
+    if test_config.hyperparam_overrides is not None:
+        print("\n" + "="*80)
+        print("Applying hyperparameter overrides:")
+        params.apply_overrides(test_config.hyperparam_overrides)
+        print("="*80 + "\n")
+    
+    # ============================
     # Start time per agent.
     # ============================
     start_time_l = [i * test_config.stagger_start_time_dt for i in range(test_config.num_agents)]
@@ -107,6 +116,7 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
         'weight_grad_cost_soft_constraints': params.weight_grad_cost_soft_constraints,
         'factor_num_interpolated_points_for_collision': params.factor_num_interpolated_points_for_collision,
         'trajectory_duration': params.trajectory_duration,
+        'horizon': params.horizon,
         'device': params.device,
         'debug': params.debug,
         'seed': params.seed,

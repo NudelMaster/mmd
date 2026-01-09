@@ -85,6 +85,7 @@ class MPD(SingleAgentPlanner):
                  n_local_inference_noising_steps: int,
                  n_local_inference_denoising_steps: int,
                  env_scale: float = None,
+                 horizon: int = None,
                  **kwargs
                  ):
         super().__init__()
@@ -133,7 +134,8 @@ class MPD(SingleAgentPlanner):
         # Extract objects from the dataset.
         dataset = train_subset.dataset
         # Number of support points in the trajectory.
-        n_support_points = dataset.n_support_points
+        # Use override horizon if provided, otherwise use dataset's value
+        n_support_points = horizon if horizon is not None else dataset.n_support_points
         # The environment.
         env = dataset.env
         # The robot. Contains the dt, the joint limits, etc.

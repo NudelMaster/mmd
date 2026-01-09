@@ -58,10 +58,10 @@ class EnvConveyor2D(EnvBase):
                     [0, -0.35]
                 ]),
                 np.array([
-                    [0.8, 0.1],
-                    [1.0, 0.1],
-                    [1.0, 0.1]
-                ]) * scale,
+                    [0.8 * scale, 0.1],
+                    [1.0 * scale, 0.1],
+                    [1.0 * scale, 0.1]
+                ]),
                 tensor_args=tensor_args
             ),
 
@@ -195,7 +195,7 @@ if __name__ == '__main__':
     mmd_root = Path(__file__).resolve().parents[4]  # Navigate to /home/.../mmd/
     output_dir = mmd_root / 'media'
     output_dir.mkdir(exist_ok=True)
-    scale = 1.3
+    scale = 1.5
     env = EnvConveyor2D(
         precompute_sdf_obj_fixed=True,
         sdf_cell_size=0.01,

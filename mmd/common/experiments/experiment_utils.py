@@ -175,6 +175,16 @@ def combine_and_save_results_for_experiment(experiment_config: MultiAgentPlannin
         df = pd.DataFrame(analyzed_results[num_agents])
         # Add a num_agents row.
         df.loc['num_agents'] = num_agents
+        
+        # Add hyperparameter configuration rows if available
+        if experiment_config.hyperparam_overrides is not None:
+            for hyperparam_name, hyperparam_value in experiment_config.hyperparam_overrides.items():
+                df.loc[hyperparam_name] = hyperparam_value
+        
+        # Add env_scale if available
+        if experiment_config.env_scale is not None:
+            df.loc['env_scale'] = experiment_config.env_scale
+        
         # # Transpose the dataframe.
         # df = df.T
         df.to_csv(fpath_results_num_agents)

@@ -62,3 +62,22 @@ class MMDParams:
     # Trained models directory.
     trained_models_dir_global_fpath = '~/mmd/data_trained_models'  # Modify this.
 
+    @classmethod
+    def apply_overrides(cls, overrides: dict):
+        """
+        Apply hyperparameter overrides to the class attributes.
+        
+        Args:
+            overrides: Dictionary of parameter names to values.
+                      Example: {'n_samples': 128, 'weight_grad_cost_collision': 4e-2}
+        """
+        if overrides is None:
+            return
+        
+        for param_name, param_value in overrides.items():
+            if hasattr(cls, param_name):
+                setattr(cls, param_name, param_value)
+                print(f"Hyperparameter override: {param_name} = {param_value}")
+            else:
+                print(f"Warning: Unknown parameter '{param_name}' - skipping")
+

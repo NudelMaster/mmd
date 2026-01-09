@@ -66,6 +66,8 @@ class MultiAgentPlanningExperimentConfig:
     render_animation = False
     # Optional scale for environment extra objects (None uses default from args.yaml or 1.0)
     env_scale: float = None
+    # Optional hyperparameter overrides for gradient guidance and sampling
+    hyperparam_overrides: dict = None
 
     def get_single_trial_configs_from_experiment_config(self):
         single_trial_configs = []
@@ -93,6 +95,7 @@ class MultiAgentPlanningExperimentConfig:
                     single_trial_config.runtime_limit = self.runtime_limit
                     single_trial_config.render_animation = self.render_animation
                     single_trial_config.env_scale = self.env_scale
+                    single_trial_config.hyperparam_overrides = self.hyperparam_overrides
                     single_trial_config.start_state_pos_l, single_trial_config.goal_state_pos_l, \
                         single_trial_config.global_model_ids, single_trial_config.agent_skeleton_l = \
                         start_state_pos_l_l[trial_number], goal_state_pos_l_l[trial_number], \
@@ -143,6 +146,8 @@ class MultiAgentPlanningSingleTrialConfig:
     instance_name = ""
     # Optional scale for environment extra objects (None uses default from args.yaml or 1.0)
     env_scale: float = None
+    # Optional hyperparameter overrides for gradient guidance and sampling
+    hyperparam_overrides: dict = None
     # The starts and goals, models ids, and skeletons.
     start_state_pos_l = []
     goal_state_pos_l = []
