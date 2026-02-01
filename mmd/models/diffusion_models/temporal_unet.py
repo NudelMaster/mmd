@@ -133,7 +133,10 @@ class TemporalUnet(nn.Module):
             x = torch.cat((x_emb, context), dim=-1)
         elif self.conditioning_type == 'attention':
             # reshape to keep the interface
-            context = einops.rearrange(context, 'b d -> b 1 d')
+            # context originally is [batch x context_dim], now for adapter we want to accecpt (B, 64, D) by doing nothing for the adapter
+            if context.ndim == 2:
+                context = einops.rearrange(context, 'b d -> b 1 d')
+            
         elif self.conditioning_type == 'default':
             c_emb = torch.cat((t_emb, context), dim=-1)
 
