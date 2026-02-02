@@ -527,6 +527,294 @@ class MapSDFEncoder(nn.Module):
 
 ---
 
+## Motivation Behind `[B, 64, 256]` Context Shape
+
+The `MapSDFEncoder` outputs a tensor of shape `[B, 64, 256]`. This section explains the reasoning behind each dimension.
+
+### Breaking Down the Shape
+
+| Dimension | Value | Meaning |
+|-----------|-------|---------|
+| `B` | Batch size | Standard batching |
+| `64` | Number of spatial tokens | Sequence length for cross-attention |
+| `256` | Feature dimension per token | Embedding size per spatial location |
+
+### Why 64 Tokens?
+
+The 64 comes from the CNN output spatial dimensions: **8×8 = 64**
+
+```
+Input SDF:     [B, 1, 64, 64]
+                      ↓ Conv stride=2
+Layer 1:       [B, 32, 32, 32]
+                      ↓ Conv stride=2
+Layer 2:       [B, 64, 16, 16]
+                      ↓ Conv stride=2
+Layer 3:       [B, 256, 8, 8]
+                      ↓ Flatten spatial dims
+Output:        [B, 256, 64]  →  permute  →  [B, 64, 256]
+```
+
+**Why 8×8 specifically?**
+- Three stride-2 convolutions: 64 → 32 → 16 → 8 (standard CNN downsampling)
+- Each of the 64 tokens represents a **8×8 = 64 pixel region** of the original 64×64 SDF
+- In physical space: each token covers `(2.0/8) × (2.0/8) = 0.25 × 0.25` units of the environment
+- This provides meaningful spatial decomposition while keeping attention cost manageable
+
+### Why 256 Feature Dimension?
+
+The 256-dimensional feature vector per token is chosen based on:
+
+| Factor | Explanation |
+|--------|-------------|
+| **Attention compatibility** | `SpatialTransformer` in TemporalUnet uses `context_dim` for cross-attention key/value projections. Must match. |
+| **Representational capacity** | 256 dims can encode rich spatial features (obstacle shapes, distances, local geometry) |
+| **Standard practice** | 256 is common in transformer architectures (BERT-small, many vision transformers) |
+| **Memory/compute tradeoff** | Larger = more expressive but slower attention; 256 is a good balance |
+
+### Why This Format for Cross-Attention?
+
+Cross-attention in transformers requires:
+- **Query**: From the main sequence (trajectory) `[B, H', dim]`
+- **Key/Value**: From the context (SDF) `[B, seq_len, context_dim]`
+
+The `[B, 64, 256]` format provides:
+- `64` = sequence length for Key/Value (number of spatial tokens)
+- `256` = `context_dim` for projection layers
+
+```
+Cross-Attention at encoder level 0:
+  Query:  trajectory [B, 64, 32]  →  project  →  [B, 64, d_head × n_heads]
+  Key:    context    [B, 64, 256] →  project  →  [B, 64, d_head × n_heads]
+  Value:  context    [B, 64, 256] →  project  →  [B, 64, d_head × n_heads]
+  
+  Attention matrix: [B, n_heads, 64, 64]  (trajectory_len × context_len)
+```
+
+### Spatial Correspondence
+
+Each of the 64 tokens has a **spatial meaning** in the environment:
+
+```
+SDF Grid [64×64]           CNN Output [8×8]           Context Tokens [64]
+┌────────────────┐         ┌──────────┐               
+│ ░░░░ ░░░░ ░░░░ │         │ 0  1  2  │  →  Flatten  →  [0, 1, 2, ..., 63]
+│ ░░░░ ░░░░ ░░░░ │    →    │ 8  9  10 │                    │
+│ ░░░░ ░░░░ ░░░░ │         │ 16 17 18 │                    │
+└────────────────┘         └──────────┘                    ▼
+                                                    Token i encodes
+                                                    region (i//8, i%8)
+                                                    of the 8×8 grid
+```
+
+**Physical interpretation:**
+- Token 0 represents the **top-left region** of the environment (around [-1, 1] to [-0.75, 0.75])
+- Token 63 represents the **bottom-right region** (around [0.75, -0.75] to [1, -1])
+- When the trajectory cross-attends to context, each waypoint can learn to "look at" relevant spatial regions
+
+### Alternative Designs Considered
+
+| Design | Shape | Pros | Cons |
+|--------|-------|------|------|
+| **Current (8×8)** | `[B, 64, 256]` | Good balance of detail and speed | Some spatial detail lost |
+| **Larger (16×16)** | `[B, 256, 256]` | Finer spatial resolution | 4× attention cost |
+| **Smaller (4×4)** | `[B, 16, 256]` | Very fast attention | Too coarse, loses spatial info |
+| **Global only** | `[B, 256]` | No attention overhead | No spatial specificity (Approach B) |
+
+### Summary
+
+The `[B, 64, 256]` shape is chosen because:
+
+1. **64 tokens** = 8×8 spatial grid from CNN downsampling, provides meaningful spatial decomposition of the environment
+2. **256 features** = rich enough to encode obstacle geometry, distances, and local structure; matches common transformer conventions
+3. **Sequence format** = ready for cross-attention with trajectory features in `SpatialTransformer`
+4. **Balanced tradeoff** = good spatial detail (each token = 0.25×0.25 physical units) with manageable attention cost (64×64 attention matrix)
+
+---
+
+## Critical Design Consideration: Is the Scale Parameter Redundant?
+
+### The Observation
+
+Currently, the `MapSDFEncoder` takes both `sdf_grid` and `scale_scalar` as inputs. However, there's a fundamental question: **Is the scale parameter redundant given that the SDF already encodes the scaled geometry?**
+
+### How Scale Affects the SDF
+
+When the environment is instantiated with a scale parameter, the obstacle geometry is scaled **before** the SDF is computed:
+
+```python
+# In env_highways_2d.py (and similar environments)
+class EnvHighways2D(EnvBase):
+    def __init__(self, scale=1.0, ...):
+        obj_list = [
+            MultiBoxField(
+                centers=np.array([...]),
+                sizes=np.array([...]) * scale,  # ← Obstacles scaled here
+                ...
+            ),
+        ]
+        super().__init__(
+            obj_fixed_list=[ObjectField(obj_list, 'highways2d')],
+            precompute_sdf_obj_fixed=True,  # SDF computed from scaled obstacles
+            ...
+        )
+```
+
+### The Flow
+
+```
+env_scale = 1.5 (hyperparameter at inference)
+       │
+       ▼
+┌─────────────────────────────────┐
+│  Environment Constructor        │
+│  EnvHighways2D(scale=1.5)       │
+│                                 │
+│  Obstacle sizes multiplied by   │
+│  scale BEFORE SDF computation   │
+└─────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────┐
+│  GridMapSDF                     │
+│                                 │
+│  SDF computed from SCALED       │
+│  obstacle positions/sizes       │
+│                                 │
+│  Resulting SDF values already   │
+│  reflect narrower corridors,    │
+│  larger obstacles, etc.         │
+└─────────────────────────────────┘
+       │
+       ▼
+   sdf_tensor [400, 400]
+   (geometry at scale 1.5 is ALREADY encoded)
+```
+
+### Implications
+
+The SDF grid **fully encodes** the effect of scaling:
+- At scale=1.0: Corridors have width X, SDF values reflect this
+- At scale=1.5: Corridors are narrower (obstacles 1.5× larger), SDF values are smaller in corridors
+- The model can learn appropriate trajectory behavior **purely from the SDF geometry**
+
+### Arguments FOR Keeping Scale Parameter
+
+| Argument | Explanation |
+|----------|-------------|
+| **Faster convergence** | Explicit scale might help the network learn faster as an auxiliary signal |
+| **Ambiguity resolution** | Two different environments at different scales could theoretically have similar local SDF patterns |
+| **Trajectory normalization** | If trajectories need to be normalized/denormalized by scale |
+| **Ablation studies** | Can test if model uses scale vs. learns purely from geometry |
+| **Future multi-scale** | If training on multiple scales simultaneously, scale helps distinguish |
+
+### Arguments AGAINST Scale Parameter (Redundancy)
+
+| Argument | Explanation |
+|----------|-------------|
+| **Already encoded in SDF** | Geometry fully captures scale through obstacle sizes |
+| **Simpler architecture** | One less input to process, fewer parameters |
+| **Purer conditioning** | Model learns from actual environment geometry, not a scalar hint |
+| **No consistency risk** | Can't have mismatch between scale param and actual SDF |
+| **Generalization** | Model learns to read geometry, not rely on explicit scale |
+
+### Recommendation
+
+**For initial implementation**: Remove the scale parameter and condition only on SDF.
+
+**Rationale**:
+1. The SDF already contains all geometric information about scale effects
+2. Simpler is better for debugging and validation
+3. If the model fails to generalize, scale can be added back as an experiment
+4. This forces the model to learn from actual obstacle geometry
+
+### Simplified MapSDFEncoder (Without Scale)
+
+```python
+class MapSDFEncoder(nn.Module):
+    def __init__(self, hidden_dim=256, output_dim=256):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),   # 64→32
+            nn.SiLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # 32→16
+            nn.SiLU(),
+            nn.Conv2d(64, hidden_dim, kernel_size=3, stride=2, padding=1),  # 16→8
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, output_dim, kernel_size=1)
+        )
+
+    def forward(self, sdf_grid):
+        """
+        Args:
+            sdf_grid: [B, 1, 64, 64] - Resized SDF grid (already encodes scale)
+        
+        Returns:
+            context: [B, 64, 256] - Spatial tokens for cross-attention
+                 OR: [B, 256] - Global vector (after pooling)
+        """
+        img_features = self.cnn(sdf_grid)  # [B, 256, 8, 8]
+        B, C, H, W = img_features.shape
+        flat_features = img_features.view(B, C, -1).permute(0, 2, 1)  # [B, 64, 256]
+        return flat_features
+```
+
+### Optional: Keep Scale for Experiments
+
+If we want to experiment with scale as an auxiliary signal, make it optional:
+
+```python
+class MapSDFEncoder(nn.Module):
+    def __init__(self, hidden_dim=256, output_dim=256, use_scale=False):
+        super().__init__()
+        self.use_scale = use_scale
+        self.cnn = nn.Sequential(...)
+        
+        if use_scale:
+            self.scale_mlp = nn.Sequential(
+                nn.Linear(1, 64),
+                nn.SiLU(),
+                nn.Linear(64, output_dim)
+            )
+
+    def forward(self, sdf_grid, scale_scalar=None):
+        img_features = self.cnn(sdf_grid)
+        flat_features = img_features.view(B, C, -1).permute(0, 2, 1)
+        
+        if self.use_scale and scale_scalar is not None:
+            scale_emb = self.scale_mlp(scale_scalar.unsqueeze(-1))
+            flat_features = flat_features + scale_emb.unsqueeze(1)
+        
+        return flat_features
+```
+
+### Updated Architecture Diagrams
+
+With this consideration, the architecture diagrams for both approaches should show scale as **optional/dashed**:
+
+```
+SDF Grid [400×400]
+       │
+       ▼
+┌─────────────────┐
+│   resize_sdf()  │
+└─────────────────┘
+       │
+       ▼
+SDF Grid [B, 1, 64, 64]     Scale [B] (OPTIONAL)
+       │                       ╎
+       └───────────┬───────────┘
+                   ▼
+┌──────────────────────────────────────┐
+│          MapSDFEncoder               │
+│  CNN: encodes SDF geometry           │
+│  Scale MLP: (optional, dashed)       │
+│  Output: [B, 64, 256]                │
+└──────────────────────────────────────┘
+```
+
+---
+
 # Approach A: Cross-Attention Conditioning
 
 ## Overview
@@ -1159,7 +1447,9 @@ Phase 3: Evaluate and Select
 ## Shared Components (Both Approaches)
 
 - [ ] Add `resize_sdf()` function to `mmd/models/helpers/map_encoder.py`
-- [ ] Create `ControlNetTrajectoryDataset` with SDF + scale fields
+- [ ] Decide on scale parameter: remove (recommended) or keep as optional
+- [ ] Update `MapSDFEncoder` to make scale optional with `use_scale=False` default
+- [ ] Create `ControlNetTrajectoryDataset` with SDF field (scale optional)
 - [ ] Update training script to pass SDF through pipeline
 
 ## Approach B Specific
@@ -1175,6 +1465,19 @@ Phase 3: Evaluate and Select
 - [ ] Modify `_create_control_mid()` to include cross-attention
 - [ ] Modify `forward()` to pass context to all cross-attention blocks
 - [ ] Match `context_dim=256` with MapSDFEncoder output
+
+---
+
+# Open Design Questions
+
+1. **Scale parameter**: Remove entirely (simpler) or keep as optional (more flexible)?
+   - **Recommendation**: Remove for initial implementation, add back if needed
+   
+2. **SDF resolution**: Keep 64×64 or experiment with other sizes?
+   - **Recommendation**: Start with 64×64, sufficient for robot size
+
+3. **Cross-attention vs Global**: Which approach first?
+   - **Recommendation**: Start with Approach B (Global), upgrade to A if needed
 
 ---
 
