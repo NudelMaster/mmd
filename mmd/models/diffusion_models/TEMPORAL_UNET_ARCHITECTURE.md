@@ -1679,6 +1679,293 @@ scale_weights_hard = {
 
 ---
 
+## OPEN QUESTION: Discrete vs. Continuous Scale Sampling
+
+**Status**: Needs discussion with advisors
+
+This section explores whether to use discrete scale values or continuous sampling during training. This is an important design decision with significant implications for generalization.
+
+### Current Approach: Discrete Scales
+
+```python
+TRAINING_SCALES = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]  # 6 discrete values
+```
+
+### Alternative: Continuous Scale Sampling
+
+```python
+# Sample any scale in the continuous range
+scale = np.random.uniform(1.0, 1.5)  # Infinite variety
+```
+
+### Tradeoffs
+
+| Aspect | Discrete (6 values) | Continuous (1.0-1.5 range) |
+|--------|---------------------|---------------------------|
+| **Variety** | 6 unique geometries | Infinite variety |
+| **Generalization** | Risk of memorizing 6 patterns | Better interpolation to unseen scales |
+| **SDF availability** | Pre-computed, exact | Need to generate somehow |
+| **Encoder efficiency** | Encode 6 SDFs once, index into results | Must encode varying SDFs per batch |
+| **Training speed** | Faster (finite encoding set) | Slower (continuous encoding) |
+
+### Options for Continuous Scales
+
+#### Option A: Pre-compute Dense Grid
+
+```python
+# Pre-compute many scales (e.g., 51 values at 0.01 increments)
+scales = np.arange(1.0, 1.51, 0.01)  # [1.00, 1.01, 1.02, ..., 1.50]
+
+# At training: sample continuous scale, snap to nearest 0.01
+continuous_scale = np.random.uniform(1.0, 1.5)
+discrete_scale = round(continuous_scale, 2)  # Snap to nearest 0.01
+sdf = sdf_cache[discrete_scale]
+```
+
+**Pros**:
+- More variety than 6 (51 unique geometries)
+- Still enables pre-computation
+- Model sees diverse scales, learns smooth generalization
+- 0.01 increment is effectively continuous from model's perspective
+
+**Cons**:
+- 51 SDFs per environment (~800KB storage - very manageable)
+- Still technically discrete (but imperceptibly so)
+
+#### Option B: Interpolate Between Pre-computed SDFs
+
+```python
+# Have 6 (or more) anchor SDFs
+scale = 1.23  # Continuous sample
+
+# Find neighbors: 1.2 and 1.3
+lower, upper = 1.2, 1.3
+alpha = (scale - lower) / (upper - lower)  # = 0.3
+
+# Interpolate: sdf_1.23 ≈ (1-alpha) * sdf_1.2 + alpha * sdf_1.3
+sdf_interpolated = (1 - alpha) * sdf_cache[1.2] + alpha * sdf_cache[1.3]
+```
+
+**Pros**:
+- True continuous scales
+- Minimal storage (only anchor SDFs)
+
+**Cons**:
+- SDF values represent signed distances - **unclear if interpolation is geometrically meaningful**
+- Interpolated SDF might not be valid (e.g., obstacles could "blur")
+- Needs experimental validation
+
+#### Option C: Compute SDFs On-the-fly
+
+```python
+# Each training sample: random scale, compute fresh SDF
+scale = np.random.uniform(1.0, 1.5)
+env = EnvHighways2D(scale=scale)
+sdf = env.compute_sdf()  # Expensive!
+```
+
+**Pros**:
+- Exact SDFs for any scale
+- True continuous sampling
+
+**Cons**:
+- Very slow training (SDF computation is expensive)
+- Not practical for large-scale training
+
+### Recommendation
+
+**Hybrid approach: Dense discrete sampling (Option A)**
+
+```python
+# Pre-compute 51 SDFs (0.01 increments)
+TRAINING_SCALES = np.arange(1.0, 1.51, 0.01).round(2).tolist()
+# [1.0, 1.01, 1.02, ..., 1.49, 1.50]
+
+# During training: sample "continuous", snap to nearest 0.01
+def sample_scale():
+    continuous = np.random.uniform(1.0, 1.5)
+    return round(continuous, 2)
+```
+
+**Why this is effectively continuous**:
+- The geometry difference between scale 1.23 and 1.24 is imperceptible
+- Model learns smooth interpolation across the range
+- Still benefits from pre-computation efficiency
+
+### Questions for Advisors
+
+1. **Is 51 discrete points sufficient?** Or should we use finer granularity (101 points at 0.005 increments)?
+
+2. **Is SDF interpolation valid?** Worth experimenting to see if interpolated SDFs produce reasonable results?
+
+3. **Scale sampling distribution**: Uniform [1.0, 1.5] or weighted toward harder scales?
+
+4. **Generalization testing**: Should we test on scales outside training range (e.g., 1.6, 0.9)?
+
+---
+
+## OPEN QUESTION: Trainable Encoder and Efficient Encoding
+
+**Status**: Needs discussion with advisors
+
+This section addresses whether the `MapSDFEncoder` should be trainable (following original ControlNet) and how to efficiently handle encoding given our finite SDF set.
+
+### Background: Original ControlNet Preprocessing
+
+In the original ControlNet paper, the condition (Canny edges, depth, pose) goes through a **trainable hint encoder**:
+
+```python
+# From ControlNet paper - the "hint encoder" IS learnable
+class ControlNet:
+    def __init__(self):
+        # This is TRAINABLE - learns which condition features matter
+        self.input_hint_block = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 32, 3, padding=1, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, 3, padding=1, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(64, 128, 3, padding=1, stride=2),
+            nn.SiLU(),
+            zero_conv(128, 320),  # Projects to match UNet channels
+        )
+```
+
+**Key insight**: The encoder learns to extract features from the condition that are relevant for the generation task.
+
+### The Question: Should `MapSDFEncoder` Be Trainable?
+
+| Approach | Description | Pros | Cons |
+|----------|-------------|------|------|
+| **Frozen Encoder** | Pre-train or freeze encoder, only train ControlNet body | Can pre-compute encoded features | Limited adaptation to task |
+| **Trainable Encoder** | Encoder is part of ControlNet, trained end-to-end | Learns task-specific features | Cannot pre-compute encoded features |
+
+**Following ControlNet faithfully**: The encoder SHOULD be trainable.
+
+**Rationale**:
+1. The encoder needs to learn which SDF features matter for trajectory planning
+2. "Obstacle at position X" needs to translate to "avoid this region in trajectory"
+3. This mapping is task-specific and should be learned
+4. Original ControlNet uses trainable preprocessing
+
+### The Efficiency Question
+
+If encoder is trainable, we cannot pre-compute encoded features (they change as weights update). But we still have only **N unique SDF grids** (where N = number of scales: 6, 51, etc.).
+
+**Naive approach (wasteful)**:
+```python
+# Batch has B=64 samples, but many share the same scale
+sdf_batch = [B, 1, 64, 64]  # Contains duplicates!
+
+# Wastefully encodes the same SDF multiple times
+encoded = encoder(sdf_batch)  # [B, 64, 256]
+
+# If 10 samples have scale=1.3, we encode sdf_1.3 ten times!
+```
+
+**Efficient approach**:
+```python
+# Only N unique SDFs exist (N = 6 or 51 depending on granularity)
+unique_sdfs = torch.stack([sdf_cache[s] for s in TRAINING_SCALES])  # [N, 1, 64, 64]
+
+# Encode all N SDFs once per forward pass
+all_encoded = encoder(unique_sdfs)  # [N, 64, 256] - only N forward passes!
+
+# For each batch, just index into pre-encoded features
+scale_indices = batch['scale_idx']  # [B] values in {0, 1, ..., N-1}
+encoded_batch = all_encoded[scale_indices]  # [B, 64, 256] - just indexing!
+```
+
+### Design with Trainable Encoder + Efficient Indexing
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   EACH FORWARD PASS                             │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ Step 1: Encode ALL unique SDFs once                       │  │
+│  │                                                           │  │
+│  │ unique_sdfs [N, 1, 64, 64] ──► encoder ──► [N, 64, 256]   │  │
+│  │                                  (trainable)              │  │
+│  │                                                           │  │
+│  │ N = number of unique scales (6, 51, or more)              │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ Step 2: Index by batch scale indices                      │  │
+│  │                                                           │  │
+│  │ scale_indices [B] ──► gather ──► encoded_batch [B,64,256] │  │
+│  │                        (no compute, just indexing)        │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  Use encoded_batch [B, 64, 256] in ControlNet                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Implementation
+
+```python
+class ControlledDiffusionModel(nn.Module):
+    def __init__(self, base_model, controlnet, sdf_cache: SDFCache):
+        super().__init__()
+        self.base_model = base_model  # Frozen
+        self.controlnet = controlnet   # Trainable (includes MapSDFEncoder)
+        
+        # Cache of raw SDF grids: [N, 1, 64, 64]
+        self.register_buffer(
+            'unique_sdfs',
+            torch.stack([sdf_cache.get_sdf(s) for s in sdf_cache.scales])
+        )
+        # Scale value to index mapping
+        self.scale_to_idx = {s: i for i, s in enumerate(sdf_cache.scales)}
+    
+    def forward(self, x, time, scales):
+        """
+        Args:
+            x: Noisy trajectory [B, 64, 4]
+            time: Diffusion timestep [B]
+            scales: Scale values for each sample [B]
+        """
+        # Step 1: Encode ALL unique SDFs once (N forward passes, not B)
+        all_encoded = self.controlnet.map_encoder(self.unique_sdfs)  # [N, 64, 256]
+        
+        # Step 2: Index into encoded features by scale
+        scale_indices = torch.tensor([self.scale_to_idx[s.item()] for s in scales])
+        encoded_batch = all_encoded[scale_indices]  # [B, 64, 256]
+        
+        # Step 3: Rest of ControlNet forward
+        residuals = self.controlnet(x, time, encoded_batch)
+        
+        # Step 4: Inject into frozen base model
+        output = self.base_model(x, time, residuals=residuals)
+        return output
+```
+
+### Summary: What Gets Trained
+
+| Component | Frozen | Trainable |
+|-----------|--------|-----------|
+| Base TemporalUnet | ✓ | |
+| ControlNet encoder/mid blocks | | ✓ |
+| MapSDFEncoder (hint encoder) | | ✓ |
+| Zero convolutions | | ✓ |
+
+### Questions for Advisors
+
+1. **Trainable vs. frozen encoder**: Should we follow ControlNet exactly (trainable) or freeze the encoder?
+
+2. **Encoding frequency**: Is encoding N SDFs per forward pass acceptable, or should we explore caching strategies that work with trainable encoders?
+
+3. **Encoder architecture**: Is a simple CNN sufficient, or should we consider pretrained vision encoders?
+
+4. **Gradient flow**: Any concerns about gradients flowing through the indexing operation?
+
+---
+
 ## Pre-computed SDF Grids
 
 ### Motivation
