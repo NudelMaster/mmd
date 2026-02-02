@@ -1481,6 +1481,655 @@ Phase 3: Evaluate and Select
 
 ---
 
+# ControlNet Training and Deployment Strategy
+
+This section provides comprehensive details on the training data pipeline, deployment architecture, and implementation strategy for the ControlNet extension.
+
+---
+
+## One ControlNet Adapter Per Environment Type
+
+### Core Principle
+
+Each environment type (EnvHighways2D, EnvConveyor2D, etc.) has its own pretrained diffusion model. We create **one ControlNet adapter per pretrained model**, where the adapter conditions that specific model on scaled versions of the **same** environment type.
+
+### Why Not a Universal ControlNet?
+
+| Approach | Description | Pros | Cons |
+|----------|-------------|------|------|
+| **Universal ControlNet** | One adapter for all environments | Single model to maintain | Different environments have different geometry patterns; may confuse the adapter |
+| **Per-Environment ControlNet** | One adapter per environment type | Adapter learns specific geometry patterns | Multiple adapters to train and store |
+
+**Decision**: Per-environment ControlNet adapters.
+
+**Rationale**:
+1. Each pretrained model was trained specifically on one environment type
+2. Geometry patterns differ significantly between environments (highways vs. conveyor vs. random obstacles)
+3. Adapter specialization leads to better quality and faster convergence
+4. Memory overhead is minimal (~3-5MB per adapter)
+
+### Directory Structure
+
+```
+data_trained_models/
+├── EnvHighways2D-RobotPlanarDisk/
+│   ├── checkpoints/
+│   │   └── ckpt_best.pth              # Original frozen TemporalUnet
+│   └── controlnet/
+│       ├── controlnet.pth             # Highways ControlNet adapter
+│       └── sdf_cache/                 # Pre-computed SDFs (optional)
+│           ├── sdf_scale_1.0.pt
+│           ├── sdf_scale_1.1.pt
+│           └── ...
+│
+├── EnvConveyor2D-RobotPlanarDisk/
+│   ├── checkpoints/
+│   │   └── ckpt_best.pth              # Original frozen TemporalUnet
+│   └── controlnet/
+│       ├── controlnet.pth             # Conveyor ControlNet adapter
+│       └── sdf_cache/
+│           └── ...
+│
+├── EnvRandomBox2D-RobotPlanarDisk/
+│   ├── checkpoints/
+│   │   └── ckpt_best.pth
+│   └── controlnet/
+│       └── controlnet.pth
+│
+└── ... (one per environment type)
+```
+
+### Loading Pattern
+
+```python
+def load_controlled_model(env_type: str, scale: float):
+    """
+    Load base model + ControlNet adapter for a specific environment type.
+    
+    Args:
+        env_type: e.g., "EnvHighways2D-RobotPlanarDisk"
+        scale: Environment scale factor (for SDF lookup)
+    
+    Returns:
+        ControlledDiffusionModel ready for inference
+    """
+    base_path = f"data_trained_models/{env_type}"
+    
+    # Load frozen base model
+    base_model = load_pretrained_unet(f"{base_path}/checkpoints/ckpt_best.pth")
+    for param in base_model.parameters():
+        param.requires_grad = False
+    
+    # Load ControlNet adapter (trained for this specific environment)
+    controlnet = load_controlnet(f"{base_path}/controlnet/controlnet.pth")
+    
+    # Optionally load pre-computed SDF
+    sdf_grid = load_precomputed_sdf(f"{base_path}/controlnet/sdf_cache", scale)
+    
+    return ControlledDiffusionModel(base_model, controlnet), sdf_grid
+```
+
+---
+
+## Training Data Strategy
+
+### Philosophy: Minimal Data for Adapters
+
+ControlNet adapters are designed to work with **significantly less data** than training from scratch. The frozen base model already contains rich trajectory priors; the adapter only needs to learn the conditioning signal.
+
+| Training Type | Typical Data Size | Rationale |
+|---------------|-------------------|-----------|
+| Original TemporalUnet | ~100K trajectories | Learn complete trajectory distribution from scratch |
+| ControlNet Adapter | ~1K-10K trajectories | Adapter only learns to "steer" existing prior |
+
+**Exact data quantity**: Left open for experimentation. Start with ~1K trajectories per scale and increase if needed.
+
+### Data Generation Pipeline
+
+#### Step 1: Generate Trajectories on Scaled Environments
+
+Use the existing MMD model **with guidance** to generate valid trajectories on scaled environments:
+
+```python
+def generate_multiscale_trajectories(env_class, scales, num_per_scale):
+    """
+    Generate training trajectories for ControlNet using existing MMD.
+    
+    Key insight: Even on scaled maps, MMD with guidance produces valid
+    trajectories. The SDF collision guidance ensures feasibility.
+    """
+    all_trajectories = []
+    
+    for scale in scales:
+        # Create scaled environment
+        env = env_class(scale=scale, ...)
+        
+        # Use existing MMD with guidance (not the ControlNet)
+        planner = MPD(
+            model=base_model,  # Original pretrained model
+            env=env,
+            use_guidance=True,  # SDF collision guidance enabled
+            ...
+        )
+        
+        for _ in range(num_per_scale):
+            # Sample start/goal
+            start, goal = env.sample_valid_start_goal()
+            
+            # Plan trajectory (with guidance for feasibility)
+            trajectory = planner.plan(start, goal)
+            
+            # Store trajectory + scale identifier
+            all_trajectories.append({
+                'trajectory': trajectory,  # [64, 4]
+                'scale': scale,
+                'start': start,
+                'goal': goal,
+            })
+    
+    return all_trajectories
+```
+
+**Why this works**:
+- The base model generates reasonable trajectory priors even on scaled maps
+- Guidance (SDF collision avoidance) ensures the trajectories are valid
+- The ControlNet adapter learns to internalize this guidance into the model itself
+
+#### Step 2: Define Discrete Scale Set
+
+```python
+# Discrete scale values for training
+TRAINING_SCALES = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+
+# Why discrete?
+# - Finite set enables pre-computing SDFs
+# - Clear interpolation targets for model generalization
+# - Simplifies data management and batching
+```
+
+### Scale Distribution in Training
+
+| Strategy | Description | Recommendation |
+|----------|-------------|----------------|
+| **Uniform** | Equal samples per scale | Start here |
+| **Weighted** | More samples at harder scales (1.4, 1.5) | If uniform struggles |
+| **Curriculum** | Start easy (1.0-1.2), gradually add harder | If training unstable |
+
+```python
+# Uniform distribution (recommended starting point)
+scale_weights = {
+    1.0: 1.0,
+    1.1: 1.0,
+    1.2: 1.0,
+    1.3: 1.0,
+    1.4: 1.0,
+    1.5: 1.0,
+}
+
+# Example weighted distribution (if needed)
+scale_weights_hard = {
+    1.0: 0.5,   # Base scale - model already good here
+    1.1: 0.8,
+    1.2: 1.0,
+    1.3: 1.2,
+    1.4: 1.5,   # Harder - more samples
+    1.5: 2.0,   # Hardest - most samples
+}
+```
+
+---
+
+## Pre-computed SDF Grids
+
+### Motivation
+
+Since we have a **finite, discrete set** of scales and **static map geometries**, we can pre-compute all SDF grids before training. This provides:
+
+1. **No runtime SDF computation** - Major speedup during training
+2. **Consistent SDF values** - No floating-point variations between runs
+3. **Simplified data pipeline** - Just look up by scale index
+
+### Storage Strategy
+
+**Decision**: Store full 400×400 SDFs, resize to 64×64 once before training (not every batch).
+
+**Rationale**:
+- 400×400 preserves maximum precision for collision checking
+- 64×64 resize is a one-time cost at training start
+- Dictionary lookup by scale is O(1) per batch
+
+### Directory Structure for Pre-computed SDFs
+
+```
+precomputed_sdfs/
+├── EnvHighways2D/
+│   ├── sdf_scale_1.0.pt     # torch.save({'sdf': [400, 400], 'scale': 1.0})
+│   ├── sdf_scale_1.1.pt
+│   ├── sdf_scale_1.2.pt
+│   ├── sdf_scale_1.3.pt
+│   ├── sdf_scale_1.4.pt
+│   └── sdf_scale_1.5.pt
+│
+├── EnvConveyor2D/
+│   ├── sdf_scale_1.0.pt
+│   └── ... (same structure)
+│
+└── ... (one folder per environment type)
+```
+
+### SDF Pre-computation Script
+
+```python
+def precompute_sdfs(env_class, env_name, scales, output_dir):
+    """
+    Pre-compute and save SDF grids for all scales of an environment.
+    
+    Run ONCE before training. Output is cached for all future training runs.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for scale in scales:
+        # Create environment at this scale
+        env = env_class(
+            scale=scale,
+            precompute_sdf_obj_fixed=True,  # Compute SDF
+            sdf_cell_size=0.005,  # Native 400×400 resolution
+            ...
+        )
+        
+        # Extract SDF grid
+        sdf_tensor = env.grid_map_sdf.sdf_tensor  # [400, 400]
+        
+        # Save full resolution
+        save_path = f"{output_dir}/sdf_scale_{scale}.pt"
+        torch.save({
+            'sdf': sdf_tensor,
+            'scale': scale,
+            'shape': sdf_tensor.shape,
+            'cell_size': 0.005,
+        }, save_path)
+        
+        print(f"Saved: {save_path} - shape {sdf_tensor.shape}")
+```
+
+### SDF Loading and Caching at Training Start
+
+```python
+class SDFCache:
+    """
+    Load and cache all SDFs for a specific environment type.
+    Resize to 64×64 once at construction, not per-batch.
+    """
+    
+    def __init__(self, env_name: str, scales: list, sdf_dir: str, target_size: int = 64):
+        """
+        Args:
+            env_name: e.g., "EnvHighways2D"
+            scales: List of scale values [1.0, 1.1, ...]
+            sdf_dir: Path to precomputed_sdfs/{env_name}/
+            target_size: Resize target (64×64)
+        """
+        self.scale_to_sdf = {}
+        
+        for scale in scales:
+            # Load full 400×400 SDF
+            data = torch.load(f"{sdf_dir}/{env_name}/sdf_scale_{scale}.pt")
+            sdf_full = data['sdf']  # [400, 400]
+            
+            # Resize to 64×64 ONCE (not every training loop)
+            sdf_resized = self._resize_sdf(sdf_full, target_size)  # [1, 64, 64]
+            
+            # Store in dictionary: scale → resized SDF
+            self.scale_to_sdf[scale] = sdf_resized
+        
+        print(f"SDFCache initialized: {len(scales)} scales, each {target_size}×{target_size}")
+    
+    def _resize_sdf(self, sdf_tensor, target_size):
+        """Resize SDF from 400×400 to target_size×target_size."""
+        # Add batch and channel dims: [400, 400] → [1, 1, 400, 400]
+        sdf = sdf_tensor.unsqueeze(0).unsqueeze(0).float()
+        
+        # Bilinear interpolation
+        sdf_resized = F.interpolate(
+            sdf, 
+            size=(target_size, target_size), 
+            mode='bilinear', 
+            align_corners=False
+        )
+        
+        return sdf_resized.squeeze(0)  # [1, 64, 64]
+    
+    def get_sdf(self, scale: float) -> torch.Tensor:
+        """
+        Get pre-computed, pre-resized SDF for a given scale.
+        O(1) dictionary lookup.
+        
+        Returns:
+            SDF tensor [1, 64, 64]
+        """
+        return self.scale_to_sdf[scale]
+    
+    def get_batch_sdf(self, scales: torch.Tensor) -> torch.Tensor:
+        """
+        Get SDFs for a batch of scale values.
+        
+        Args:
+            scales: Tensor of scale values [B]
+        
+        Returns:
+            Batch of SDFs [B, 1, 64, 64]
+        """
+        sdfs = [self.get_sdf(s.item()) for s in scales]
+        return torch.stack(sdfs, dim=0)  # [B, 1, 64, 64]
+```
+
+### Alternative: Scale Index Instead of Scale Value
+
+For simpler lookups, use integer indices:
+
+```python
+# Mapping: index → scale
+SCALE_INDEX_TO_VALUE = {
+    0: 1.0,
+    1: 1.1,
+    2: 1.2,
+    3: 1.3,
+    4: 1.4,
+    5: 1.5,
+}
+
+# In dataset, store scale_idx instead of scale
+sample = {
+    'trajectory': trajectory,  # [64, 4]
+    'scale_idx': 3,            # Means scale=1.3
+}
+
+# In SDFCache, lookup by index
+def get_sdf_by_idx(self, scale_idx: int) -> torch.Tensor:
+    scale = SCALE_INDEX_TO_VALUE[scale_idx]
+    return self.scale_to_sdf[scale]
+```
+
+---
+
+## Training Batch Structure
+
+### Batch Composition
+
+All samples in a training batch are from the **same environment type** (since each ControlNet is environment-specific), but samples **differ in scale** and thus have different SDF grids.
+
+```python
+# Training batch for EnvHighways2D ControlNet
+batch = {
+    'trajectory': torch.Tensor,  # [B, 64, 4] - Trajectories from MMD on scaled Highways
+    'sdf_grid': torch.Tensor,    # [B, 1, 64, 64] - Pre-computed SDF for each sample's scale
+    'scale': torch.Tensor,       # [B] - Scale values (optional, for logging/debugging)
+    'start': torch.Tensor,       # [B, 4] - Start positions (optional)
+    'goal': torch.Tensor,        # [B, 4] - Goal positions (optional)
+}
+```
+
+### Example Batch
+
+```python
+# Example: B=8 batch from EnvHighways2D ControlNet training
+batch = {
+    'trajectory': tensor([B=8, 64, 4]),  # 8 trajectories
+    'sdf_grid': tensor([
+        # Sample 0: scale=1.0, SDF from precomputed cache
+        [1, 64, 64],  # Wide corridors
+        # Sample 1: scale=1.3
+        [1, 64, 64],  # Narrower corridors
+        # Sample 2: scale=1.5
+        [1, 64, 64],  # Narrowest corridors
+        # ...
+    ]),  # [8, 1, 64, 64]
+    'scale': tensor([1.0, 1.3, 1.5, 1.1, 1.2, 1.4, 1.0, 1.5]),  # [8]
+}
+```
+
+### Dataset Class
+
+```python
+class ControlNetTrajectoryDataset(Dataset):
+    """
+    Dataset for training ControlNet on a specific environment type.
+    
+    Key design:
+    - Trajectories come from .npz file (generated by MMD with guidance)
+    - SDFs come from pre-computed cache (not computed on-the-fly)
+    - Scale is stored per sample but SDF lookup uses scale value
+    """
+    
+    def __init__(
+        self,
+        trajectory_file: str,
+        sdf_cache: SDFCache,
+        tensor_args: dict,
+    ):
+        """
+        Args:
+            trajectory_file: Path to .npz with trajectories + scales
+            sdf_cache: Pre-loaded SDFCache with resized grids
+            tensor_args: {'device': ..., 'dtype': ...}
+        """
+        data = np.load(trajectory_file)
+        
+        self.trajectories = torch.tensor(data['trajectories'], **tensor_args)  # [N, 64, 4]
+        self.scales = torch.tensor(data['scales'], **tensor_args)  # [N]
+        self.sdf_cache = sdf_cache
+        
+        print(f"Loaded {len(self)} trajectories across scales: {torch.unique(self.scales).tolist()}")
+    
+    def __len__(self):
+        return len(self.trajectories)
+    
+    def __getitem__(self, idx):
+        trajectory = self.trajectories[idx]  # [64, 4]
+        scale = self.scales[idx]  # scalar
+        
+        # Look up pre-computed, pre-resized SDF (O(1))
+        sdf_grid = self.sdf_cache.get_sdf(scale.item())  # [1, 64, 64]
+        
+        return {
+            'trajectory': trajectory,
+            'sdf_grid': sdf_grid,
+            'scale': scale,
+        }
+```
+
+### DataLoader Configuration
+
+```python
+# Training DataLoader
+train_loader = DataLoader(
+    dataset=ControlNetTrajectoryDataset(
+        trajectory_file="data_trajectories/EnvHighways2D/multiscale_trajs.npz",
+        sdf_cache=SDFCache("EnvHighways2D", TRAINING_SCALES, "precomputed_sdfs"),
+        tensor_args=tensor_args,
+    ),
+    batch_size=64,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
+)
+```
+
+---
+
+## Training Loop Overview
+
+```python
+def train_controlnet(
+    base_model: TemporalUnet,
+    controlnet: MMDControlNet,
+    train_loader: DataLoader,
+    num_epochs: int,
+    lr: float = 1e-4,
+):
+    """
+    Train ControlNet adapter while keeping base model frozen.
+    
+    Key points:
+    - Base model is FROZEN (no gradients)
+    - ControlNet is TRAINABLE
+    - Loss is standard diffusion L2 loss
+    - SDF is passed as conditioning
+    """
+    # Freeze base model
+    base_model.eval()
+    for param in base_model.parameters():
+        param.requires_grad = False
+    
+    # ControlNet is trainable
+    controlnet.train()
+    optimizer = torch.optim.AdamW(controlnet.parameters(), lr=lr)
+    
+    for epoch in range(num_epochs):
+        for batch in train_loader:
+            trajectory = batch['trajectory']  # [B, 64, 4]
+            sdf_grid = batch['sdf_grid']      # [B, 1, 64, 64]
+            
+            # Sample diffusion timesteps
+            t = torch.randint(0, num_diffusion_steps, (B,), device=device)
+            
+            # Add noise to trajectory
+            noise = torch.randn_like(trajectory)
+            x_noisy = q_sample(trajectory, t, noise)  # Noisy trajectory
+            
+            # Forward through controlled model
+            # ControlNet processes SDF and injects residuals into base model
+            noise_pred = controlled_model(
+                x=x_noisy,
+                time=t,
+                sdf_grid=sdf_grid,
+                # scale parameter is OPTIONAL (SDF already encodes it)
+            )
+            
+            # L2 loss between predicted and actual noise
+            loss = F.mse_loss(noise_pred, noise)
+            
+            # Backward pass (only ControlNet params updated)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        print(f"Epoch {epoch}: loss={loss.item():.4f}")
+    
+    # Save trained ControlNet
+    torch.save(controlnet.state_dict(), "controlnet.pth")
+```
+
+---
+
+## Inference Strategy
+
+**Status**: To Be Explored
+
+This section will be expanded after the training pipeline is validated. Key considerations:
+
+### Open Questions for Inference
+
+| Question | Options | Notes |
+|----------|---------|-------|
+| **SDF source** | Pre-computed cache vs. compute on-the-fly | Pre-computed for training scales, on-the-fly for arbitrary scales |
+| **Integration with MPD** | Modify `MPD.plan()` to use ControlNet | Need to update planner to pass SDF |
+| **Guidance interaction** | ControlNet only vs. ControlNet + guidance | ControlNet may reduce need for guidance |
+| **Multi-agent support** | `MPDEnsemble` with ControlNet | Same pattern, shared SDF |
+| **Arbitrary scales** | Interpolation between discrete scales? | Model may generalize naturally |
+
+### Preliminary Inference Flow
+
+```python
+def inference_with_controlnet(
+    env_type: str,
+    scale: float,
+    start: torch.Tensor,
+    goal: torch.Tensor,
+):
+    """
+    Plan trajectory using ControlNet-conditioned model.
+    
+    Status: Conceptual - needs implementation and testing.
+    """
+    # Load models
+    controlled_model, sdf_grid = load_controlled_model(env_type, scale)
+    
+    # If scale not in pre-computed set, compute SDF on-the-fly
+    if sdf_grid is None:
+        env = create_environment(env_type, scale)
+        sdf_grid = compute_and_resize_sdf(env)
+    
+    # Initialize random trajectory
+    x = torch.randn([1, 64, 4], device=device)
+    
+    # Diffusion sampling loop (DDPM or DDIM)
+    for t in reversed(range(num_steps)):
+        # Get noise prediction conditioned on SDF
+        noise_pred = controlled_model(x, t, sdf_grid)
+        
+        # Denoise step
+        x = denoise_step(x, noise_pred, t)
+        
+        # Optional: Apply guidance for additional constraints
+        # x = guidance_step(x, env, start, goal)
+    
+    # Condition on start/goal
+    x[:, 0, :] = start
+    x[:, -1, :] = goal
+    
+    return x  # [1, 64, 4] - Planned trajectory
+```
+
+### Expected Inference Behavior
+
+| Scenario | Expected Outcome |
+|----------|------------------|
+| **Scale in training set (1.0-1.5)** | Good performance, model has seen this geometry |
+| **Scale slightly outside (1.6)** | Reasonable generalization expected |
+| **Scale far outside (2.0)** | May need guidance assistance |
+| **New environment type** | Requires training new ControlNet adapter |
+
+---
+
+## Summary: What and How
+
+### What We're Building
+
+| Component | Purpose | Status |
+|-----------|---------|--------|
+| **ControlNet Adapter** | Conditions trajectory diffusion on SDF geometry | Architecture documented |
+| **Per-Environment Adapters** | One adapter per pretrained model | Strategy defined |
+| **Pre-computed SDFs** | Cached 64×64 grids for fast training | Pipeline documented |
+| **Trajectory Dataset** | Multi-scale trajectories from guided MMD | Strategy defined |
+| **Training Script** | Train ControlNet while freezing base | Pseudocode provided |
+| **Inference Integration** | Use ControlNet in MPD planning | To Be Explored |
+
+### How We're Achieving It
+
+| Phase | Action | Files Involved |
+|-------|--------|----------------|
+| **1. SDF Utilities** | Add `resize_sdf()`, make scale optional in `MapSDFEncoder` | `map_encoder.py` |
+| **2. Pre-compute SDFs** | Script to generate and cache SDFs for all (env, scale) pairs | `scripts/generate_data/` |
+| **3. Generate Trajectories** | Use existing MMD+guidance on scaled envs | `scripts/generate_data/` |
+| **4. Dataset Class** | `ControlNetTrajectoryDataset` with SDF lookup | `mmd/datasets/` |
+| **5. Update ControlNet** | Integrate `MapSDFEncoder`, implement Approach B | `controlnet.py` |
+| **6. Training Script** | End-to-end training with frozen base | `scripts/train_diffusion/` |
+| **7. Inference** | Integrate into MPD planner | To Be Explored |
+
+### Key Design Decisions Summary
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Scale parameter | Remove (SDF encodes it) | Simpler, no redundancy |
+| SDF storage | Full 400×400, resize once | Preserve precision, fast training |
+| Conditioning approach | Start with B (Global), upgrade to A | Lower risk first |
+| Adapter scope | One per environment | Specialization for quality |
+| Training data | Minimal (~1K-10K per scale) | Adapters need less data |
+| Scale lookup | Dictionary: scale → SDF | O(1) lookup |
+
+---
+
 # References
 
 - **ControlNet Paper**: Zhang et al., "Adding Conditional Control to Text-to-Image Diffusion Models"
