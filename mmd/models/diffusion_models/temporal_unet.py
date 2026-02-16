@@ -118,10 +118,14 @@ class TemporalUnet(nn.Module):
             nn.Conv1d(unet_input_dim, state_dim, 1),
         )
 
-    def forward(self, x, time, context):
+    def forward(self, x, time, context,
+                down_block_additional_residuals=None,
+                mid_block_additional_residual=None):
         """
         x : [ batch x horizon x state_dim ]
         context: [batch x context_dim]
+        down_block_additional_residuals: list of tensors to add to skip connections (for ControlNet)
+        mid_block_additional_residual: tensor to add after mid block (for ControlNet)
         """
         b, h, d = x.shape
 
@@ -132,10 +136,8 @@ class TemporalUnet(nn.Module):
             context = einops.repeat(context, 'm n -> m h n', h=h)
             x = torch.cat((x_emb, context), dim=-1)
         elif self.conditioning_type == 'attention':
-            # reshape to keep the interface
-            # context originally is [batch x context_dim], now for adapter we want to accecpt (B, 64, D) by doing nothing for the adapter
-            if context.ndim == 2:
-                context = einops.rearrange(context, 'b d -> b 1 d')
+            # reshape to keep the interface            
+            context = einops.rearrange(context, 'b d -> b 1 d')
             
         elif self.conditioning_type == 'default':
             c_emb = torch.cat((t_emb, context), dim=-1)
@@ -160,9 +162,17 @@ class TemporalUnet(nn.Module):
         if self.conditioning_type == 'attention':
             x = self.mid_attention(x, context=context)
         x = self.mid_block2(x, c_emb)
+        
+        # ControlNet: Inject mid-block residual
+        if mid_block_additional_residual is not None:
+            x = x + mid_block_additional_residual
 
         for resnet, resnet2, attn_self, attn_conditioning, upsample in self.ups:
-            x = torch.cat((x, h.pop()), dim=1)
+            # ControlNet: Inject down-block residuals into skip connections
+            skip = h.pop()
+            if down_block_additional_residuals is not None:
+                skip = skip + down_block_additional_residuals.pop()
+            x = torch.cat((x, skip), dim=1)
             x = resnet(x, c_emb)
             x = resnet2(x, c_emb)
             x = attn_self(x)

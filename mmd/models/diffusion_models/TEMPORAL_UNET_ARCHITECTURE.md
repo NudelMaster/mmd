@@ -2417,10 +2417,238 @@ def inference_with_controlnet(
 
 ---
 
+# Verified Base Model Configuration
+
+**Date verified**: During implementation review
+
+All 5 pretrained models were checked. None override `conditioning_type`, `time_emb_dim`, or `self_attention` from constructor defaults.
+
+## Verified Parameters
+
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| `conditioning_type` | `None` | `temporal_unet.py:34` (default, never overridden) |
+| `time_emb_dim` | `32` | `temporal_unet.py:31` (default, never overridden) |
+| `cond_dim` | `32` | `= time_emb_dim + 0` (since `conditioning_type=None`) |
+| `self_attention` | `False` | `temporal_unet.py:32` (default, never overridden) |
+| `conditioning_embed_dim` | `4` | Irrelevant (only used when `conditioning_type != None`) |
+| `unet_input_dim` | `32` | All 5 `args.yaml` files |
+| `state_dim` | `4` | 2D position + 2D velocity |
+| `n_support_points` | `64` | All trajectory configs |
+
+## Two dim_mults Variants
+
+| Option | `dim_mults` | `dims` | Enc / Dec | Models |
+|--------|------------|--------|-----------|--------|
+| 0 | `(1, 2, 4)` | `[4, 32, 64, 128]` | 3 / 2 | EnvHighways2D, EnvDropRegion2D, EnvEmptyNoWait2D |
+| 1 | `(1, 2, 4, 8)` | `[4, 32, 64, 128, 256]` | 4 / 3 | EnvEmpty2D, EnvConveyor2D |
+
+## Key Implications
+
+1. **`context=None` is safe** — `conditioning_type=None` means no context concatenation
+2. **No attention blocks exist** in any pretrained model (`self_attention=False`)
+3. **`cond_dim=32` is correct** for all models (no `conditioning_embed_dim` addition)
+4. **`n_support_points` is a dead parameter** in `ResidualTemporalBlock` — accepted but never used
+
+---
+
+# Implementation Decisions
+
+**Date decided**: During design review
+
+## Decisions Made
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| 1 | Conditioning approach | **Approach B** (Global FiLM) | Simpler, uses existing FiLM mechanism, clean experimental signal |
+| 2 | Encoder design | **Design 2** (SDF via time embedding) | Avoids cross-domain mapping problem (2D SDF → 1D trajectory) |
+| 3 | Target environment | **EnvConveyor2D** | `dim_mults=(1,2,4,8)`, 4 enc / 3 dec, matches existing doc traces |
+| 4 | Self-attention | **None** (faithful copy) | Base model has `self_attention=False`; ControlNet mirrors it |
+| 5 | Residual count | **3** down + 1 mid | Match decoder levels; h[0] is never consumed by decoder |
+| 6 | Scale parameter | **Removed** | SDF already encodes scaled geometry (see redundancy analysis above) |
+
+## Design 2 Architecture (Implemented)
+
+```
+SDF [B,1,64,64]
+     │
+     ▼
+MapSDFEncoder (trainable CNN, 250K params)
+     │
+     ▼
+[B, 256, 8, 8] → global avg pool → [B, 256] → MLP → [B, 32]
+     │
+     ▼
+cond_emb = t_emb + sdf_emb   [B, 32]
+     │
+     ├──────────────────────────────────────────┐
+     ▼                                          ▼
+ CONTROLNET ENCODER (trainable, 3.4M params) FROZEN BASE MODEL (3.9M params)
+ │                                           │
+ │ Level 0: ResBlock×2(cond_emb), Down       │ (runs independently)
+ │ Level 1: ResBlock×2(cond_emb), Down       │
+ │ Level 2: ResBlock×2(cond_emb), Down       │
+ │ Level 3: ResBlock×2(cond_emb), Identity   │
+ │ Mid: ResBlock×2(cond_emb)                 │
+ │                                           │
+ │ ZeroConv residuals:                       │ Injection:
+ │   down[1] → [B, 64, 32]  ───────────────►│   skip h[1] += residual
+ │   down[2] → [B, 128, 16] ───────────────►│   skip h[2] += residual
+ │   down[3] → [B, 256, 8]  ───────────────►│   skip h[3] += residual
+ │   mid     → [B, 256, 8]  ───────────────►│   mid output += residual
+ │                                           │
+ │ (Level 0: NO residual — h[0] unused)      │
+```
+
+## Verified Shapes (Smoke Test)
+
+| Component | Shape | Notes |
+|-----------|-------|-------|
+| SDF input | `[B, 1, 64, 64]` | After `resize_sdf()` from 400×400 |
+| SDF embedding | `[B, 32]` | Matches `cond_dim` / `time_emb_dim` |
+| Down residual[0] | `[B, 64, 32]` | For decoder level 2 (skip h[1]) |
+| Down residual[1] | `[B, 128, 16]` | For decoder level 1 (skip h[2]) |
+| Down residual[2] | `[B, 256, 8]` | For decoder level 0 (skip h[3]) |
+| Mid residual | `[B, 256, 8]` | Added after mid_block2 |
+| Output | `[B, 64, 4]` | Same as base model |
+
+## Parameter Counts
+
+| Component | Parameters | Trainable |
+|-----------|-----------|-----------|
+| MapSDFEncoder (CNN + projection) | 250,848 | Yes |
+| Control TimeEncoder | 5,280 | Yes |
+| Control encoder (4 levels) | 2,821,120 | Yes |
+| Control mid blocks | 264,192 | Yes |
+| Zero convolutions (3 down + 1 mid) | 67,776 | Yes |
+| **Total ControlNet** | **3,409,216** | **Yes** |
+| Base TemporalUnet | 3,954,052 | Frozen |
+| **Total model** | **7,363,268** | |
+
+## Gradient Verification
+
+Smoke test confirmed:
+- 138 ControlNet parameter tensors receive gradients
+- 0 base model parameter tensors receive gradients
+- Forward pass, backward pass, and loss computation all succeed
+
+---
+
+# Design 1 (Hint at Input) — Advisor Reference
+
+**Status**: Deferred. Documented here for future advisor discussion.
+
+## What It Is
+
+The original ControlNet pattern: encode SDF into a tensor matching the trajectory shape `[B, 4, 64]`, add it directly to the trajectory input before the ControlNet encoder. The encoder then processes a combined trajectory+SDF signal.
+
+```
+SDF [B,1,64,64] → small CNN → [B, 4, 64]
+                                    ↓
+x_ctrl = trajectory + hint     [B, 4, 64]
+                                    ↓
+              ControlNet encoder processes combined signal
+```
+
+## Arguments For (Future Exploration)
+
+1. **Faithfulness to the original ControlNet paper** — the paper's key design has the hint added to the input before the encoder copy processes it. Deviating from this removes the paper's theoretical backing.
+
+2. **Per-position information** — each of the 64 trajectory positions receives a different SDF-derived signal. If the mapping can be solved, each waypoint could get spatially-relevant obstacle information. Design 2 gives every waypoint identical global information.
+
+3. **Richer signal propagation** — the hint permeates through all encoder levels via the residuals. In Design 2, SDF information only enters via the `[B, 32]` FiLM vector — a 32-dimensional bottleneck.
+
+## Why We Deferred It
+
+1. **Cross-domain mapping is undefined** — the 64 trajectory positions correspond to time steps, not spatial locations. A waypoint at step 30 could be anywhere in the environment. There is no natural pixel-to-pixel correspondence as in the original ControlNet (Canny edges → images share pixel grids).
+
+2. **Questionable CNN design** — a CNN mapping `[B, 1, 64, 64]` → `[B, 4, 64]` must collapse one spatial dimension while preserving the other. The "64" in the output has no clear physical meaning.
+
+3. **Approach B + Design 2 tests the core hypothesis first** — if global SDF conditioning via FiLM shows zero benefit, spatial conditioning is unlikely to help either. If it shows benefit, Design 1 or Approach A (cross-attention) become motivated follow-ups.
+
+## Potential Design 1 Variants (For Future Discussion)
+
+| Variant | Encoding | Pros | Cons |
+|---------|----------|------|------|
+| **Flatten rows** | CNN → `[B, 4, 64]` where 64 = flattened 8×8 | Simple | Arbitrary spatial-to-temporal mapping |
+| **Learnable projection** | CNN → `[B, C, 8, 8]` → learned linear → `[B, 4, 64]` | Flexible | Black box |
+| **Positional SDF lookup** | At each waypoint, sample SDF at (x,y) position | Physically meaningful | Complex: requires differentiable grid sampling, changes per denoising step |
+
+The third variant (positional lookup) is the most interesting — it sidesteps the cross-domain problem by looking up SDF values **at each waypoint's spatial location**. But it's considerably more complex and couples SDF conditioning to the current trajectory state during denoising.
+
+---
+
+# Note on Attention-Based Conditioning (Approach A)
+
+The earlier sections of this document describe Approach A (Cross-Attention) as leveraging "existing cross-attention infrastructure" in the base model. After verifying the pretrained model configs, this requires correction:
+
+**All pretrained models have `self_attention=False` and `conditioning_type=None`.**
+
+This means:
+- No `SpatialTransformer` blocks exist in any pretrained encoder
+- No `LinearAttention` blocks exist (all are `nn.Identity()`)
+- Approach A would add attention blocks that have **no counterpart** in the frozen base model
+
+This is a significant deviation from the original ControlNet principle (trainable copy starts as exact clone of frozen model). The base model's encoder has **never seen attention** — adding it to the ControlNet branch creates an architectural mismatch.
+
+If Approach A is pursued in the future, this should be an explicit discussion point with the advisor: is the attention mismatch between the ControlNet branch and the frozen base model acceptable?
+
+---
+
+# Implementation Status
+
+## Files Modified
+
+| File | Status | Description |
+|------|--------|-------------|
+| `mmd/models/helpers/map_encoder.py` | **IMPLEMENTED** | `MapSDFEncoder` (Design 2), `resize_sdf()` utility |
+| `mmd/models/diffusion_models/controlnet.py` | **IMPLEMENTED** | `ZeroConv1d`, `MMDControlNet`, `ControlledDiffusionModel` |
+| `scripts/train_diffusion/train_controlnet.py` | **IMPLEMENTED** | Training script with fixed bugs, SDF pipeline |
+| `mmd/models/diffusion_models/temporal_unet.py` | **COMPLETED (Phase 1)** | Injection ports for residuals |
+| `mmd/models/diffusion_models/__init__.py` | **COMPLETED** | Exports controlnet module |
+
+## Implementation Queue (Remaining)
+
+| Priority | Task | Status |
+|----------|------|--------|
+| **HIGH** | Create `ControlNetTrajectoryDataset` with SDF field | Pending (discuss design first) |
+| **MEDIUM** | Create SDF pre-computation script for EnvConveyor2D | Pending |
+| **MEDIUM** | Generate multi-scale trajectory data for training | Pending |
+| **MEDIUM** | End-to-end training run validation | Pending |
+| **LOW** | Inference integration with MPD planner | Deferred |
+
+## Bugs Fixed
+
+| Bug | Original | Fix |
+|-----|----------|-----|
+| Wrong dict key | `batch_dict[dataset.field_key_traj]` → KeyError | `batch_dict[f'{dataset.field_key_traj}_normalized']` |
+| No SDF data | `batch_dict.get('controlnet_hint', None)` always None | `batch_dict['sdf_grid']` from ControlNet dataset |
+| context=None crash | Concern about `conditioning_type='default'` | Verified: all models use `conditioning_type=None`, safe |
+| Hardcoded cond_dim | `cond_dim=32` might be wrong | Verified: correct for all models |
+
+## Checklist Update
+
+### Shared Components
+- [x] Add `resize_sdf()` function to `mmd/models/helpers/map_encoder.py`
+- [x] Remove scale parameter from `MapSDFEncoder` (SDF encodes it)
+- [ ] Create `ControlNetTrajectoryDataset` with SDF field
+- [x] Update training script to pass SDF through pipeline
+
+### Approach B (Global FiLM) — Chosen for Implementation
+- [x] `MapSDFEncoder`: CNN → global pool → projection → `[B, 32]`
+- [x] `MMDControlNet.forward()`: `cond_emb = t_emb + sdf_emb`
+- [x] Zero convolutions: 3 down + 1 mid (matching decoder levels)
+- [x] `ControlledDiffusionModel`: full forward + loss computation
+- [x] Smoke test: shapes, gradients, forward/backward
+- [ ] End-to-end training run
+
+---
+
 # References
 
 - **ControlNet Paper**: Zhang et al., "Adding Conditional Control to Text-to-Image Diffusion Models"
 - **Base TemporalUnet**: `mmd/models/diffusion_models/temporal_unet.py`
 - **MapSDFEncoder**: `mmd/models/helpers/map_encoder.py`
-- **SpatialTransformer**: `mmd/models/layers/layers_attention.py`
-- **Current ControlNet**: `mmd/models/diffusion_models/controlnet.py`
+- **ControlNet**: `mmd/models/diffusion_models/controlnet.py`
+- **Training Script**: `scripts/train_diffusion/train_controlnet.py`
+- **SpatialTransformer**: `mmd/models/layers/layers_attention.py` (not used in current implementation)
