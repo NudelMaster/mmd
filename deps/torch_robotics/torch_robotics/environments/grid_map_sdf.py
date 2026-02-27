@@ -25,7 +25,7 @@ class GridMapSDF:
         self.map_dim = map_dim
         self.cell_size = cell_size
         self.cmap_dim = torch.ceil(map_dim/cell_size).type(torch.LongTensor).to(self.tensor_args['device'])
-
+        print(f"GridMapSDF: cmap_dim = {self.cmap_dim}, map_dim = {self.map_dim}, cell_size = {self.cell_size}")
         self.points_for_sdf = None
         self.sdf_tensor = None
         self.grad_sdf_tensor = None

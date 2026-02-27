@@ -66,7 +66,7 @@ class EnvConveyor2D(EnvBase):
             ),
 
         ]
-
+        print(f"Creating EnvConveyor2D with cell size {sdf_cell_size}.")
         super().__init__(
             name=name,
             limits=torch.tensor([[-1, -1], [1, 1]], **tensor_args),  # Environments limits.
@@ -195,7 +195,7 @@ if __name__ == '__main__':
     mmd_root = Path(__file__).resolve().parents[4]  # Navigate to /home/.../mmd/
     output_dir = mmd_root / 'media'
     output_dir.mkdir(exist_ok=True)
-    scale = 1.5
+    scale = 1
     env = EnvConveyor2D(
         precompute_sdf_obj_fixed=True,
         sdf_cell_size=0.01,
@@ -219,7 +219,11 @@ if __name__ == '__main__':
     plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
     print(f"Saved: {output_path}")
     plt.close()
-    
+    print(f"Environment limits: {env.limits}")
+    print(f"SDF tensor shape: {env.grid_map_sdf_obj_fixed.sdf_tensor.shape}")
+    print(f"cmap_dim: {env.grid_map_sdf_obj_fixed.cmap_dim}")
+    print(f"cell_size: {env.grid_map_sdf_obj_fixed.cell_size}")
+    print(f"map_dim: {env.grid_map_sdf_obj_fixed.map_dim}")
     # env = EnvConveyor2D(
     #     precompute_sdf_obj_fixed=True,
     #     sdf_cell_size=0.01,

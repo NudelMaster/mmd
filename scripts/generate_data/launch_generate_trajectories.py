@@ -28,7 +28,7 @@ hostname = socket.gethostname()
 LOCAL = True  # Force local execution
 TEST = False
 # USE_CUDA = True
-USE_CUDA = False
+USE_CUDA = True if os.getenv('CUDA_VISIBLE_DEVICES') is not None else False
 
 N_SEEDS = num_contexts
 

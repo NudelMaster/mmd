@@ -20,7 +20,7 @@ Usage:
 Note:
     Requires:
     - Path to pretrained model (pretrained_model_dir)
-    - Dataset with SDF grids (ControlNetTrajectoryDataset — TODO)
+    - Dataset with SDF grids (ControlNetTrajectoryDataset)
     - Pre-computed SDF cache for the target environment
 """
 import os
@@ -285,8 +285,9 @@ def experiment(
 
     ########################################################################
     # Dataset
-    dataset_subdir: str = 'EnvConveyor2D-RobotPlanarDisk',
+    dataset_subdir: str = 'EnvConveyor2D-RobotPlanarDisk-multiscale',
     include_velocity: bool = True,
+    sdf_cache_dir: str = None,
 
     ########################################################################
     # ControlNet
@@ -350,6 +351,7 @@ def experiment(
         project=wandb_project,
         config={
             'pretrained_model_dir': pretrained_model_dir,
+            'sdf_cache_dir': sdf_cache_dir,
             'sdf_encoder_hidden_dim': sdf_encoder_hidden_dim,
             'lr': lr,
             'batch_size': batch_size,
@@ -360,12 +362,11 @@ def experiment(
     ########################################################################
     # Load Dataset
     ########################################################################
-    # TODO: Replace with ControlNetTrajectoryDataset that provides sdf_grid
-    # For now, use base TrajectoryDataset (sdf_grid will need to be added)
     train_subset, train_dataloader, val_subset, val_dataloader = get_dataset(
-        dataset_class='TrajectoryDataset',
+        dataset_class='ControlNetTrajectoryDataset',
         include_velocity=include_velocity,
         dataset_subdir=dataset_subdir,
+        sdf_cache_dir=sdf_cache_dir,
         batch_size=batch_size,
         results_dir=results_dir,
         save_indices=True,

@@ -237,22 +237,113 @@ Encode SDF to `[B, 64, 256]` context tokens. Each trajectory position cross-atte
 
 | File | Status | Description |
 |------|--------|-------------|
+| `mmd/datasets/controlnet_dataset.py` | **Done** | `ControlNetTrajectoryDataset` with scale-aware loading + `sdf_grid` output |
 | `mmd/models/helpers/map_encoder.py` | **Done** | `MapSDFEncoder` (Design 2), `resize_sdf()` |
 | `mmd/models/diffusion_models/controlnet.py` | **Done** | `ZeroConv1d`, `MMDControlNet`, `ControlledDiffusionModel` |
 | `mmd/models/diffusion_models/temporal_unet.py` | **Done** | Injection ports (backward-compatible) |
 | `mmd/models/diffusion_models/__init__.py` | **Done** | Exports |
-| `scripts/train_diffusion/train_controlnet.py` | **Done** | Training script |
+| `scripts/train_diffusion/train_controlnet.py` | **Done** | Training script now uses `ControlNetTrajectoryDataset` + `sdf_cache_dir` |
 | `scripts/generate_data/precompute_sdfs.py` | **Done** | SDF pre-computation |
-| `scripts/generate_data/generate_multiscale_data.py` | **Done** | Multi-scale trajectory generation (MPD-based) |
+| `scripts/generate_data/generate_multiscale_data.py` | **Done (rewritten)** | Multi-scale trajectory generation aligned with `MMDParams` + inference defaults |
 
 ### Remaining
 
 | Priority | Task | Notes |
 |----------|------|-------|
-| **High** | `ControlNetTrajectoryDataset` | Provides `sdf_grid` per batch; extends existing directory structure |
-| **Medium** | End-to-end training run | Validate full pipeline |
+| **High** | End-to-end ControlNet training run | Next immediate step; dataset generation and format validation are complete |
+| **Medium** | Short training smoke + full training | Run a short sanity pass first, then full run |
 | **Low** | Inference integration with MPD | Conditional: scale input → ControlNet, else original |
 | **Deferred** | Trainable vs frozen encoder optimization | Works as-is; optimize later if needed |
+
+### Full Multi-Scale Generation (Completed)
+
+Executed command:
+
+```bash
+python scripts/generate_data/generate_multiscale_data.py \
+    --env_id EnvConveyor2D \
+    --model_id EnvConveyor2D-RobotPlanarDisk \
+    --scales 1.0 1.1 1.2 1.3 1.4 1.5 \
+    --num_trajs_per_scale 500
+```
+
+Generated dataset summary:
+
+- Output root: `data_trajectories/EnvConveyor2D-RobotPlanarDisk-multiscale/`
+- Scales generated: `scale_1.00`, `scale_1.10`, `scale_1.20`, `scale_1.30`, `scale_1.40`, `scale_1.50`
+- Per-scale tensor shape: `trajs-free.pt` is `[500, 64, 4]` (`float32`)
+- Total trajectories: `3000` (6 × 500)
+- Args consistency verified:
+  - `obstacle_cutoff_margin: 0.02`
+  - `threshold_start_goal_pos: 1.0`
+  - `env_scale` matches each scale directory
+- SDF cache coverage verified for all training scales (`sdf_scale_1.00.pt` ... `sdf_scale_1.50.pt`)
+- `ControlNetTrajectoryDataset` load test and DataLoader collation test passed
+
+### Args Compatibility Validation (Completed)
+
+Concern addressed: original dataset args came from a different (classical-planner) generation script, so we validated which fields are actually required for current MPD-based ControlNet training.
+
+- `obstacle_cutoff_margin` and `threshold_start_goal_pos` are now written to match the original EnvConveyor2D dataset conventions:
+  - `obstacle_cutoff_margin: 0.02`
+  - `threshold_start_goal_pos: 1.0`
+- Updated in both:
+  - top-level dataset args: `...-multiscale/0/args.yaml`
+  - per-scale args: `...-multiscale/scale_X.XX/0/args.yaml`
+- Validation outcome for training relevance:
+  - Diffusion/ControlNet loss uses trajectory tensors and SDF grids directly.
+  - `args.yaml` fields are mainly consumed to construct `PlanningTask` (collision/eval context), not to compute training loss.
+  - Keeping these values aligned still avoids silent drift in evaluation/inference behavior.
+
+### Smoke Regeneration (Completed)
+
+Re-ran smoke generation after args fix:
+
+```bash
+python scripts/generate_data/generate_multiscale_data.py \
+    --env_id EnvConveyor2D \
+    --robot_id RobotPlanarDisk \
+    --model_id EnvConveyor2D-RobotPlanarDisk \
+    --scales 1.0 \
+    --num_trajs_per_scale 20 \
+    --n_samples 8 \
+    --n_guide_steps 5
+```
+
+Generated output verifies corrected args values:
+
+- `data_trajectories/EnvConveyor2D-RobotPlanarDisk-multiscale/0/args.yaml`
+- `data_trajectories/EnvConveyor2D-RobotPlanarDisk-multiscale/scale_1.00/0/args.yaml`
+
+Both contain:
+
+```yaml
+env_scale: 1.0
+obstacle_cutoff_margin: 0.02
+threshold_start_goal_pos: 1.0
+```
+
+### Dataset Integration Implemented
+
+`ControlNetTrajectoryDataset` is now implemented with explicit scale-aware loading:
+
+1. Walks `scale_X.XX/*/trajs-free.pt` directories explicitly (not generic `os.walk` over all folders)
+2. Parses `X.XX` scale from directory names and stores per-trajectory scale mapping
+3. Loads required SDF files from cache (`sdf_scale_{X:.2f}.pt`)
+4. Resizes native SDF grids to `[1, 64, 64]` via `resize_sdf()` at dataset init
+5. Returns `{traj_normalized, task_normalized, hard_conds, sdf_grid}` in `__getitem__`
+
+This closes the training-time wiring gap where `batch_dict['sdf_grid']` was missing.
+
+### Validation Run (Pre-Data-Generation)
+
+The following validations were run after implementation and before any data generation:
+
+- Python compile check for modified files (`py_compile`) to catch syntax/import issues
+- Import resolution check to verify `ControlNetTrajectoryDataset` is exported via `mmd.datasets`
+- Training script wiring check to ensure `get_dataset()` now requests `ControlNetTrajectoryDataset`
+
+No data-generation scripts were executed in this validation phase.
 
 ### Bugs Fixed
 
@@ -289,14 +380,31 @@ python scripts/generate_data/precompute_sdfs.py \
 
 ### 2. Generate Multi-Scale Trajectories (Ready)
 Generate training trajectories at discrete scales using the **pretrained MMD diffusion model** (as a prior).
-*Implemented in `scripts/generate_data/generate_multiscale_data.py`.*
+*Implemented in `scripts/generate_data/generate_multiscale_data.py` and rewritten to match the inference pipeline parameter wiring (`MMDParams`, `apply_overrides`, repo-root `TRAINED_MODELS_DIR`).*
 
 ```bash
 python scripts/generate_data/generate_multiscale_data.py \
     --env_id EnvConveyor2D \
     --model_id EnvConveyor2D-RobotPlanarDisk \
     --scales 1.0 1.1 1.2 1.3 1.4 1.5 \
-    --num_trajs 500
+    --num_trajs_per_scale 500
+```
+
+Status: **Executed successfully** for all 6 scales; output validated as training-ready.
+
+Optional overrides (same style as inference launcher):
+
+```bash
+python scripts/generate_data/generate_multiscale_data.py \
+    --model_id EnvConveyor2D-RobotPlanarDisk \
+    --scales 1.0 1.1 1.2 1.3 1.4 1.5 \
+    --num_trajs_per_scale 500 \
+    --weight_grad_cost_collision 0.02 \
+    --weight_grad_cost_smoothness 0.08 \
+    --weight_grad_cost_constraints 0.2 \
+    --weight_grad_cost_soft_constraints 0.02 \
+    --start_guide_steps_fraction 0.5 \
+    --n_guide_steps 20
 ```
 
 #### Data Analysis & Tradeoffs
@@ -312,9 +420,102 @@ Train the adapter using the pretrained base model and the multi-scale dataset.
 
 ```bash
 python scripts/train_diffusion/train_controlnet.py \
-    --pretrained_model_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk/<TIMESTAMP>_<ID> \
+    --pretrained_model_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk \
     --dataset_subdir EnvConveyor2D-RobotPlanarDisk-multiscale \
+    --sdf_cache_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk/controlnet/sdf_cache \
     --results_dir logs_controlnet \
     --batch_size 32 \
     --lr 1e-4
 ```
+
+#### Training command presets (recommended variants)
+
+**A) Short smoke test (correctness only, quick turnaround)**
+
+```bash
+python scripts/train_diffusion/train_controlnet.py \
+    --pretrained_model_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk \
+    --dataset_subdir EnvConveyor2D-RobotPlanarDisk-multiscale \
+    --sdf_cache_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk/controlnet/sdf_cache \
+    --results_dir logs_controlnet_smoke \
+    --batch_size 16 \
+    --lr 1e-4 \
+    --num_train_steps 40 \
+    --steps_til_summary 10 \
+    --steps_til_ckpt 20 \
+    --wandb_mode disabled
+```
+
+Use this to validate data loading, forward/backward, validation pass, and checkpoint writing.
+
+**B) Standard full training run (default baseline)**
+
+```bash
+python scripts/train_diffusion/train_controlnet.py \
+    --pretrained_model_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk \
+    --dataset_subdir EnvConveyor2D-RobotPlanarDisk-multiscale \
+    --sdf_cache_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk/controlnet/sdf_cache \
+    --results_dir logs_controlnet_full \
+    --batch_size 32 \
+    --lr 1e-4 \
+    --num_train_steps 100000 \
+    --steps_til_summary 100 \
+    --steps_til_ckpt 10000 \
+    --wandb_mode online
+```
+
+Use this as the primary experiment configuration for the 3K multi-scale dataset.
+
+**C) Memory-safe run (smaller GPU memory footprint)**
+
+```bash
+python scripts/train_diffusion/train_controlnet.py \
+    --pretrained_model_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk \
+    --dataset_subdir EnvConveyor2D-RobotPlanarDisk-multiscale \
+    --sdf_cache_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk/controlnet/sdf_cache \
+    --results_dir logs_controlnet_bs16 \
+    --batch_size 16 \
+    --lr 1e-4 \
+    --num_train_steps 100000 \
+    --steps_til_summary 100 \
+    --steps_til_ckpt 10000 \
+    --wandb_mode online
+```
+
+Use this when batch size 32 is unstable/OOM; same optimizer settings, smaller batch.
+
+**D) Throughput-focused run (mixed precision)**
+
+```bash
+python scripts/train_diffusion/train_controlnet.py \
+    --pretrained_model_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk \
+    --dataset_subdir EnvConveyor2D-RobotPlanarDisk-multiscale \
+    --sdf_cache_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk/controlnet/sdf_cache \
+    --results_dir logs_controlnet_amp \
+    --batch_size 32 \
+    --lr 1e-4 \
+    --use_amp True \
+    --num_train_steps 100000 \
+    --steps_til_summary 100 \
+    --steps_til_ckpt 10000 \
+    --wandb_mode online
+```
+
+Use this for faster training on compatible GPUs; verify numerical stability against run B.
+
+Notes on differences:
+
+- `batch_size`: main memory/performance knob (`32` faster if it fits, `16` safer).
+- `num_train_steps`: target step budget used to derive epochs from dataset size.
+- `use_amp`: enables mixed precision (`torch.autocast`) to improve throughput.
+- `steps_til_summary` / `steps_til_ckpt`: monitoring/checkpoint frequency (lower values = denser logging, more I/O).
+- `wandb_mode`: `disabled` for smoke testing, `online` for full tracked experiments.
+
+### 4. Next Steps (Immediate)
+
+1. Run a short training smoke test (small `n_epochs` / fewer steps) to verify stable loss and checkpoint writing.
+2. Launch full ControlNet training on the generated 3K multi-scale dataset.
+3. Run inference comparison at scales `1.0` to `1.5`:
+   - base model + guidance (baseline)
+   - base + ControlNet (conditioned on SDF)
+4. Report collision-free rate and trajectory quality per scale to evaluate whether SDF conditioning improves robustness at larger scales.
