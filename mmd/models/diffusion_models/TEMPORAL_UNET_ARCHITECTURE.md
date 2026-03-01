@@ -131,12 +131,17 @@ cond_emb = t_emb + sdf_emb   [B, 32]
 | Component | Parameters | Trainable |
 |-----------|-----------|-----------|
 | MapSDFEncoder (CNN + projection) | 250,848 | Yes |
-| Control TimeEncoder | 5,280 | Yes |
-| Control encoder (4 levels) | 2,821,120 | Yes |
-| Control mid blocks | 264,192 | Yes |
-| Zero convolutions (3 down + 1 mid) | 67,776 | Yes |
+| Control TimeEncoder | 8,352 | Yes |
+| Control encoder (4 levels) | 1,667,072 | Yes |
+| Control mid blocks | 1,330,688 | Yes |
+| Zero convolutions (3 down + 1 mid) | 152,256 | Yes |
 | **Total ControlNet** | **3,409,216** | **Yes** |
 | Base TemporalUnet | 3,954,052 | Frozen |
+
+Counts above were re-validated from instantiated modules (EnvConveyor2D settings: `dim_mults=(1,2,4,8)`, `state_dim=4`, `n_support_points=64`):
+
+- `trainable_from_wrapper = 3,409,216`
+- `num_trainable_tensors = 138`
 
 ### Verified (Smoke Test)
 
@@ -246,14 +251,14 @@ Encode SDF to `[B, 64, 256]` context tokens. Each trajectory position cross-atte
 | `scripts/generate_data/precompute_sdfs.py` | **Done** | SDF pre-computation |
 | `scripts/generate_data/generate_multiscale_data.py` | **Done (rewritten)** | Multi-scale trajectory generation aligned with `MMDParams` + inference defaults |
 
-### Remaining
+### Remaining (Updated)
 
 | Priority | Task | Notes |
 |----------|------|-------|
-| **High** | End-to-end ControlNet training run | Next immediate step; dataset generation and format validation are complete |
-| **Medium** | Short training smoke + full training | Run a short sanity pass first, then full run |
-| **Low** | Inference integration with MPD | Conditional: scale input → ControlNet, else original |
-| **Deferred** | Trainable vs frozen encoder optimization | Works as-is; optimize later if needed |
+| **High** | Inference integration with MPD | Wire `ControlledDiffusionModel` into rollout/sampling path |
+| **High** | Base vs ControlNet evaluation | Compare metrics across scales 1.0 to 1.5 |
+| **Medium** | Overfitting mitigation study | Current run shows widening train/val gap after ~30K steps |
+| **Low** | Trainable vs frozen encoder optimization | Works as-is; optimize later if needed |
 
 ### Full Multi-Scale Generation (Completed)
 
@@ -322,6 +327,53 @@ env_scale: 1.0
 obstacle_cutoff_margin: 0.02
 threshold_start_goal_pos: 1.0
 ```
+
+### Full ControlNet Training (Completed)
+
+Full training was executed on the generated multi-scale dataset:
+
+```bash
+python scripts/train_diffusion/train_controlnet.py \
+    --pretrained_model_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk \
+    --dataset_subdir EnvConveyor2D-RobotPlanarDisk-multiscale \
+    --sdf_cache_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk/controlnet/sdf_cache \
+    --results_dir logs_controlnet_full \
+    --batch_size 32 \
+    --lr 1e-4 \
+    --num_train_steps 100000 \
+    --steps_til_summary 100 \
+    --steps_til_ckpt 10000 \
+    --wandb_mode disabled
+```
+
+Key outcomes:
+
+- Total executed steps: `96,030` (derived by epoch conversion from `num_train_steps=100000`)
+- Wall-clock time: about `69 minutes` (`19:23 -> 20:32` from checkpoint timestamps)
+- Throughput: about `23.8 it/s` (`~1430 steps/min`) at `batch_size=32`, `use_amp=False`
+- Train loss: `1.049 -> 0.078` (min observed: `0.052`)
+- Validation loss: `1.002 -> 0.134` (min observed: `0.097` at step ~34,700)
+- Best saved checkpoint nearest the minimum val step: `checkpoints/controlnet_epoch_0333_iter_030000_state_dict.pth`
+- EMA checkpoint saved: `checkpoints/ema_controlnet_final_state_dict.pth`
+
+Observed behavior:
+
+- Validation improves quickly early, then plateaus around `0.12-0.14` after ~20K steps
+- Train loss keeps decreasing after validation plateaus
+- Train/val gap grows over time, indicating mild overfitting on the 3K-trajectory dataset
+
+### WandB Logging Fixes Applied
+
+Two instrumentation issues were fixed in `scripts/train_diffusion/train_controlnet.py`:
+
+1. **Double `wandb.init()` fixed**
+   - `@single_experiment_yaml` already initializes wandb.
+   - Explicit `wandb.init()` in the experiment function was removed.
+   - Script now uses `wandb.config.update(...)` only.
+
+2. **Validation loss logging fixed**
+   - Previously only `train_loss` was logged.
+   - Now both `train_loss` and `val_loss` are logged in a merged `wandb.log(...)` call.
 
 ### Dataset Integration Implemented
 
@@ -513,9 +565,175 @@ Notes on differences:
 
 ### 4. Next Steps (Immediate)
 
-1. Run a short training smoke test (small `n_epochs` / fewer steps) to verify stable loss and checkpoint writing.
-2. Launch full ControlNet training on the generated 3K multi-scale dataset.
-3. Run inference comparison at scales `1.0` to `1.5`:
+1. Integrate ControlNet into MPD inference path (scale/SDF-conditioned denoising at test time).
+2. Run base vs ControlNet evaluation at scales `1.0` to `1.5`:
    - base model + guidance (baseline)
    - base + ControlNet (conditioned on SDF)
-4. Report collision-free rate and trajectory quality per scale to evaluate whether SDF conditioning improves robustness at larger scales.
+3. Report per-scale metrics (collision-free rate, quality/smoothness, success rate).
+4. If overfitting persists in evaluation, test mitigations:
+   - increase trajectory diversity per scale (`n_samples` lower during generation)
+   - early stopping around the best validation region (~30K-40K steps)
+   - regularization/data augmentation as needed
+
+Recommended first inference checkpoint order:
+
+1. `checkpoints/ema_controlnet_final_state_dict.pth` (usually best generalization)
+2. `checkpoints/controlnet_epoch_0333_iter_030000_state_dict.pth` (nearest best-val region)
+3. final non-EMA checkpoint (for ablation)
+
+---
+
+## 9. Training Time Estimates (Measured + Projected)
+
+### Measured Baseline (Run B)
+
+Measured on the completed full run (`logs_controlnet_full/0`):
+
+- Configuration: `batch_size=32`, `use_amp=False`
+- Effective executed steps: `96,030`
+- Wall-clock: about `69 minutes`
+- Throughput: about `23.8 it/s` (`~1430 steps/min`)
+- Rule of thumb from measured run: about `7.0 minutes per 10,000 steps`
+
+### Preset Runtime Estimates
+
+The table below gives practical estimates for the four command presets in Section 8.3.
+
+| Preset | Batch Size | AMP | Target Steps | Time Estimate | Basis |
+|--------|------------|-----|--------------|---------------|-------|
+| A (Smoke) | 16 | No | 40 | `< 1 min` (typically 10-30 s) | direct scaling from measured throughput |
+| B (Standard) | 32 | No | 100,000 | about `70 min` (measured run finished in 69 min at 96,030 steps) | measured |
+| C (Memory-safe) | 16 | No | 100,000 | about `90-100 min` | projected (smaller batch + more dataloader/validation overhead) |
+| D (AMP) | 32 | Yes | 100,000 | about `50-60 min` | projected (typical AMP speedup ~1.2-1.4x) |
+
+Important caveats:
+
+- Exact time depends on GPU model, clock state, and system load.
+- Validation cadence (`steps_til_summary`) and number of validation batches add overhead.
+- `num_train_steps` is converted to epochs and then run as full epochs (`get_num_epochs`), so actual executed steps can differ from the target.
+- Use run B as the anchor for this machine; recalibrate if hardware changes.
+
+---
+
+## 10. Training Script Workflow (`train_controlnet.py`)
+
+This section explains the actual execution path of `scripts/train_diffusion/train_controlnet.py`.
+
+### Entry and Experiment Setup
+
+1. `experiment()` is decorated with `@single_experiment_yaml`.
+2. The decorator handles results-directory setup and wandb startup.
+3. Script updates wandb metadata via `wandb.config.update(...)` (no explicit `wandb.init()`).
+4. Random seed is fixed (`fix_random_seed(seed)`), and `tensor_args` are built.
+
+### Dataset Loading
+
+1. `get_dataset(...)` is called with `dataset_class='ControlNetTrajectoryDataset'`.
+2. Dataset returns per-batch fields including:
+   - trajectory: `{field_key_traj}_normalized`
+   - `hard_conds`
+   - `sdf_grid` (`[B, 1, 64, 64]`)
+3. Train/val subset indices are saved under the run directory.
+
+### Model Construction
+
+1. Build `TemporalUnet` with settings matching pretrained model (`dim_mults=(1,2,4,8)` for Conveyor).
+2. Wrap in `GaussianDiffusionModel`.
+3. Load pretrained checkpoint (`ema_model_current_state_dict.pth` by default).
+4. Create `MMDControlNet(base_model=diffusion_model.model, cond_dim=32, ...)`.
+5. Wrap both inside `ControlledDiffusionModel`.
+6. Base diffusion model is frozen; optimizer receives only ControlNet parameters.
+
+### Training Loop
+
+For each batch:
+
+1. Move batch to device (`dict_to_device`).
+2. Compute loss via `controlnet_loss_fn(...)`, which calls:
+   - `controlled_model.loss(traj, hard_conds, sdf_grid)`
+3. Backpropagate, apply gradient clipping, optimizer step, optional AMP scaler updates.
+4. Update EMA ControlNet copy every `update_ema_every` steps.
+5. Every `steps_til_summary`:
+   - print train metrics
+   - run short validation pass (up to 11 val mini-batches)
+   - log `train_loss` and `val_loss` to wandb
+6. Every `steps_til_ckpt`:
+   - save ControlNet checkpoint(s)
+   - save EMA state dict
+   - save loss arrays (`train_losses.npy`, `val_losses.npy`)
+
+### Epoch/Step Accounting
+
+`num_train_steps` is converted with:
+
+```
+epochs = ceil(num_train_steps * batch_size / dataset_len)
+```
+
+Implication: training completes whole epochs, so actual step count may be slightly lower or higher than the requested `num_train_steps` target.
+
+### Artifacts Saved Per Run
+
+- `args.yaml` (full run configuration)
+- `checkpoints/controlnet_current_state_dict.pth`
+- versioned checkpoints: `controlnet_epoch_XXXX_iter_XXXXXX_state_dict.pth`
+- `checkpoints/ema_controlnet_current_state_dict.pth` and final EMA state dict
+- `checkpoints/train_losses.npy`, `checkpoints/val_losses.npy`
+- split indices (`train_subset_indices.pt`, `val_subset_indices.pt`)
+
+---
+
+## 11. WandB Usage Guide
+
+### Enable/Disable
+
+- Disabled (local or smoke): `--wandb_mode disabled`
+- Online tracking: `--wandb_mode online`
+
+Example full run with wandb enabled:
+
+```bash
+python scripts/train_diffusion/train_controlnet.py \
+    --pretrained_model_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk \
+    --dataset_subdir EnvConveyor2D-RobotPlanarDisk-multiscale \
+    --sdf_cache_dir data_trained_models/EnvConveyor2D-RobotPlanarDisk/controlnet/sdf_cache \
+    --results_dir logs_controlnet_full_wandb \
+    --batch_size 32 \
+    --lr 1e-4 \
+    --num_train_steps 100000 \
+    --steps_til_summary 100 \
+    --steps_til_ckpt 10000 \
+    --wandb_mode online
+```
+
+### Expected Project Metadata
+
+- `wandb_project`: `mmd_controlnet`
+- `wandb_entity`: `scoreplan`
+
+These defaults come from the experiment signature and can be overridden if needed.
+
+### What Gets Logged
+
+At each summary step (`steps_til_summary`):
+
+- `train_loss`
+- `val_loss` (when validation dataloader is enabled)
+- step index (`train_steps_current`) as wandb step
+
+### Common Pitfalls
+
+1. Do not add manual `wandb.init()` in this script; decorator already initializes wandb.
+2. Keep `steps_til_summary` reasonable (too small adds overhead and noisy curves).
+3. Ensure network/auth is configured before `--wandb_mode online` runs.
+
+### Recommended Tracking Practice
+
+For reproducible comparisons, keep one run per clear configuration change:
+
+- baseline full run (B)
+- memory-safe comparison (C)
+- AMP comparison (D)
+- any overfitting mitigation run (data size, early stopping, regularization)
+
+Name `results_dir` accordingly so local artifacts align with wandb runs.
