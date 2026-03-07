@@ -83,6 +83,7 @@ class EnvHighways2DRobotPlanarDiskRandom(MMDPlanningProblemConfig):
         start_state_pos_l, goal_state_pos_l = get_start_goal_pos_random_in_env(num_agents=num_agents,
                                                                                env_class=EnvHighways2D,
                                                                                tensor_args=params.tensor_args,
+                                                                               margin=0.15,
                                                                                env_scale=env_scale)
         global_model_ids = [['EnvHighways2D-RobotPlanarDisk']]
         agent_skeleton_l = [[[0, 0]]] * num_agents

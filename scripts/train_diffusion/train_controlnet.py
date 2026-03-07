@@ -203,6 +203,8 @@ def train_controlnet(
 
                     train_losses_l.append((train_steps_current, train_losses_log))
 
+                    validation_losses_log = {}
+
                     # Validation
                     if val_dataloader is not None:
                         controlled_model.eval()
@@ -221,10 +223,17 @@ def train_controlnet(
 
                         val_loss_mean = np.mean(val_losses_total)
                         print(f"Validation loss: {val_loss_mean:.6f}")
-                        validation_losses_l.append((train_steps_current, {'val_loss': val_loss_mean}))
+                        validation_losses_log = {'val_loss': float(val_loss_mean)}
+                        validation_losses_l.append((train_steps_current, validation_losses_log))
                         controlled_model.train()
 
-                    wandb.log({'train_loss': train_loss_batch.item()}, step=train_steps_current)
+                    wandb.log(
+                        {
+                            'train_loss': train_loss_batch.item(),
+                            **validation_losses_log,
+                        },
+                        step=train_steps_current,
+                    )
 
                 # Optimization
                 optimizer.zero_grad()
@@ -344,19 +353,17 @@ def experiment(
     device = get_torch_device(device=device)
     tensor_args = {'device': device, 'dtype': torch.float32}
 
-    # Initialize wandb
-    wandb.init(
-        mode=wandb_mode,
-        entity=wandb_entity,
-        project=wandb_project,
-        config={
+    # WandB is initialized by @single_experiment_yaml; only update config here.
+    wandb.config.update(
+        {
             'pretrained_model_dir': pretrained_model_dir,
             'sdf_cache_dir': sdf_cache_dir,
             'sdf_encoder_hidden_dim': sdf_encoder_hidden_dim,
             'lr': lr,
             'batch_size': batch_size,
             'unet_dim_mults_option': unet_dim_mults_option,
-        }
+        },
+        allow_val_change=True,
     )
 
     ########################################################################
@@ -451,9 +458,6 @@ def experiment(
         debug=debug,
         tensor_args=tensor_args,
     )
-
-    wandb.finish()
-
 
 if __name__ == '__main__':
     run_experiment(experiment)
