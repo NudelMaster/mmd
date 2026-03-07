@@ -27,7 +27,6 @@ Target configuration (EnvConveyor2D):
     4 encoder levels, 3 decoder levels
     self_attention = False
 """
-import copy
 import torch
 import torch.nn as nn
 import einops
@@ -334,4 +333,71 @@ class ControlledDiffusionModel(nn.Module):
         super().train(mode)
         self.diffusion_model.eval()
         self.controlnet.train(mode)
+        return self
+
+
+class ControlNetInferenceWrapper(nn.Module):
+    """
+    Inference-time wrapper combining a frozen TemporalUnet with a trained ControlNet.
+
+    This wrapper replaces the TemporalUnet stored in GaussianDiffusionModel.model
+    while preserving the same call signature: forward(x, time, context). During
+    each denoising step it:
+
+    1. Expands a pre-computed SDF embedding to the current batch size
+    2. Runs the ControlNet encoder on the same noisy trajectory fed to the base UNet
+    3. Scales the resulting residuals
+    4. Injects them into the frozen base model through the existing ControlNet hooks
+
+    The SDF grid is fixed for an MPD planner instance, so its embedding is computed
+    once during initialization rather than once per diffusion step.
+    """
+
+    def __init__(self, base_model, controlnet, sdf_grid, control_scale=1.0):
+        super().__init__()
+
+        self.base_model = base_model
+        self.controlnet = controlnet
+        self.state_dim = base_model.state_dim
+        self.control_scale = control_scale
+
+        sdf_grid = sdf_grid.detach().float()
+        if sdf_grid.dim() != 4 or sdf_grid.shape[1] != 1:
+            raise ValueError(
+                f"Expected sdf_grid with shape [B, 1, H, W], got {tuple(sdf_grid.shape)}"
+            )
+        if sdf_grid.shape[0] != 1:
+            raise ValueError(
+                f"Expected a single cached SDF grid with batch size 1, got {sdf_grid.shape[0]}"
+            )
+
+        self.register_buffer('sdf_grid', sdf_grid, persistent=False)
+
+        with torch.no_grad():
+            sdf_emb = self.controlnet.map_encoder(self.sdf_grid)
+        self.register_buffer('sdf_emb', sdf_emb.detach(), persistent=False)
+
+        self.base_model.eval()
+        self.controlnet.eval()
+
+    def forward(self, x, time, context):
+        batch_size = x.shape[0]
+        sdf_emb = self.sdf_emb.expand(batch_size, -1)
+
+        down_residuals, mid_residual = self.controlnet(x, time, sdf_emb)
+
+        if self.control_scale != 1.0:
+            down_residuals = [residual * self.control_scale for residual in down_residuals]
+            mid_residual = mid_residual * self.control_scale
+
+        return self.base_model(
+            x, time, context,
+            down_block_additional_residuals=down_residuals,
+            mid_block_additional_residual=mid_residual,
+        )
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.base_model.eval()
+        self.controlnet.eval()
         return self

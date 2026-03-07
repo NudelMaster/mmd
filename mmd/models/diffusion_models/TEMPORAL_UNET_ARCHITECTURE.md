@@ -906,3 +906,557 @@ Although the script now supports correct wandb logging, the completed full run d
 - `wandb_mode = disabled`
 
 So for that run, the authoritative logs are the local artifacts under `logs_controlnet_full/0/`, not WandB.
+
+## 13. Inference Integration (Implemented)
+
+This section documents the ControlNet inference integration that connects the trained adapter to the existing MPD planner while preserving the original MMD inference stack.
+
+### Official ControlNet Reference and Principles
+
+Before implementing inference, the official ControlNet repository (`lllyasviel/ControlNet`) was reviewed to re-check how ControlNet is connected at inference time.
+
+Key principles from the official implementation:
+
+1. The base diffusion model remains the main entry point used by the sampler.
+2. The sampler itself is unaware of ControlNet internals.
+3. The same noisy latent `x_t` is fed to both the ControlNet branch and the frozen base UNet.
+4. ControlNet produces zero-initialized residuals that are injected into the frozen decoder path.
+5. Inference supports a control strength multiplier (`control_scales` in the official repo).
+
+Our implementation follows the same principles, adapted to the MMD codebase and to the cross-domain conditioning setting (SDF grid -> trajectory diffusion model).
+
+### Final Inference Design in MMD
+
+Instead of subclassing the full diffusion model like the official Stable Diffusion implementation, MMD uses a lighter integration because the existing code already exposes the needed hook points.
+
+#### Existing MMD Hook Points
+
+- `GaussianDiffusionModel` calls `self.model(x, t, context)` during DDPM and DDIM sampling.
+- `TemporalUnet.forward(...)` already accepts:
+  - `down_block_additional_residuals`
+  - `mid_block_additional_residual`
+
+This means we do **not** need to modify the sampler or the diffusion wrapper.
+
+#### Wrapper Strategy
+
+A new class was added:
+
+- `mmd/models/diffusion_models/controlnet.py::ControlNetInferenceWrapper`
+
+This wrapper replaces `diffusion_model.model` (the base `TemporalUnet`) inside `MPD`.
+
+It presents the same interface as the base UNet:
+
+```python
+forward(x, time, context)
+```
+
+Internally it performs:
+
+1. expand cached SDF embedding to batch size
+2. run `MMDControlNet(x, time, sdf_emb)`
+3. scale residuals by `control_scale`
+4. call the frozen base UNet with residual injection kwargs
+
+This is functionally analogous to the official ControlNet `apply_model(...)` orchestration step, except that in MMD the orchestration is placed in a wrapper object rather than a subclass of the diffusion model.
+
+### Why the Wrapper Is Faithful to Official ControlNet Principles
+
+Official ControlNet uses:
+
+- a frozen base UNet
+- a trainable ControlNet encoder copy
+- one orchestration point that combines both during inference
+
+Our wrapper preserves all three:
+
+- frozen base `TemporalUnet`
+- trained `MMDControlNet`
+- one orchestration point: `ControlNetInferenceWrapper.forward(...)`
+
+So although the implementation pattern differs (composition instead of subclassing), the inference behavior follows the same ControlNet logic.
+
+### SDF Embedding Cache at Inference
+
+For one MPD planner instance, the environment scale is fixed, so the SDF grid is fixed as well.
+
+Therefore the wrapper:
+
+- stores the resized SDF grid once
+- computes `sdf_emb = map_encoder(sdf_grid)` once during initialization
+- reuses that embedding for every denoising step
+
+This avoids recomputing the SDF CNN about 100 times per planning call.
+
+This is an intentional optimization specific to our use case. It does **not** change the ControlNet computation graph conceptually; it only removes repeated evaluation of a fixed conditioning input.
+
+### Control Strength at Inference
+
+The official ControlNet implementation exposes per-block `control_scales`.
+
+To preserve the same experimental principle, MMD inference now supports:
+
+- `control_scale: float = 1.0`
+
+This uniformly scales all ControlNet residuals before they are injected into the base UNet.
+
+This gives us a clean ablation knob:
+
+- `control_scale = 0.0` -> effectively base model behavior
+- `control_scale = 1.0` -> default ControlNet strength
+- `control_scale > 1.0` -> stronger ControlNet influence
+
+For now we use a single scalar rather than one scale per residual because the trajectory UNet has only 3 skip residuals + 1 mid residual, and a uniform scale is the simplest experimental control.
+
+### Files Modified for Inference Integration
+
+#### Core model code
+
+- `mmd/models/diffusion_models/controlnet.py`
+  - added `ControlNetInferenceWrapper`
+
+- `mmd/planners/single_agent/mpd.py`
+  - added optional args:
+    - `controlnet_checkpoint_path`
+    - `sdf_cache_dir`
+    - `control_scale`
+  - loads ControlNet checkpoint
+  - loads cached SDF for current `env_scale`
+  - wraps `diffusion_model.model` before `torch.compile(...)`
+
+#### Experiment/config plumbing
+
+- `mmd/common/experiments/experiments.py`
+  - added ControlNet fields to experiment config objects
+
+- `scripts/inference/inference_multi_agent.py`
+  - passes ControlNet config from `test_config` into MPD
+  - explicitly rejects ControlNet with `MPDEnsemble`
+
+- `scripts/inference/launch_multi_agent_experiment.py`
+  - added CLI args for ControlNet inference
+  - added CLI arg for choosing `MPD` vs `MPDEnsemble`
+
+- `mmd/planners/single_agent/mpd_ensemble.py`
+  - added explicit guard so ControlNet args cannot be silently ignored
+
+### Why `MPDEnsemble` Is Not Enabled Yet
+
+ControlNet training was performed specifically for the `EnvConveyor2D` base model configuration (`dim_mults=(1,2,4,8)`).
+
+`MPDEnsemble` may mix different model IDs and different UNet architectures. Silently applying one ControlNet checkpoint there would be unsafe and could fail by architecture mismatch or produce misleading results.
+
+So for now:
+
+- ControlNet inference is supported only for `MPD`
+- `MPDEnsemble` raises a clear error if ControlNet args are supplied
+
+This is safer and gives a cleaner experimental signal.
+
+### Status After Integration
+
+Implemented:
+
+- wrapper-based ControlNet inference connection
+- ControlNet checkpoint loading inside `MPD`
+- SDF cache loading by `env_scale`
+- uniform control strength scaling
+- experiment/CLI plumbing
+- explicit unsupported-path guard for `MPDEnsemble`
+
+Still required after this code integration:
+
+1. compare base vs ControlNet performance across scales using the original `MMDParams`
+
+### Validation Executed
+
+The modified files were syntax-checked with:
+
+```bash
+python3 -m py_compile mmd/models/diffusion_models/controlnet.py mmd/planners/single_agent/mpd.py mmd/planners/single_agent/mpd_ensemble.py mmd/common/experiments/experiments.py scripts/inference/inference_multi_agent.py scripts/inference/launch_multi_agent_experiment.py
+```
+
+#### Smoke Test 1: Base MPD Path (No ControlNet)
+
+Exact command used:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+from einops._torch_specific import allow_ops_in_compiled_graph
+from mmd.planners.single_agent.mpd import MPD
+
+allow_ops_in_compiled_graph()
+base = Path('/home/dsi/yefimnu/diffusion_projects/mmd')
+planner = MPD(
+    model_id='EnvConveyor2D-RobotPlanarDisk',
+    planner_alg='mmd',
+    start_state_pos=None,
+    goal_state_pos=None,
+    use_guide_on_extra_objects_only=False,
+    start_guide_steps_fraction=0.5,
+    n_guide_steps=1,
+    n_diffusion_steps_without_noise=1,
+    weight_grad_cost_collision=2e-2,
+    weight_grad_cost_smoothness=8e-2,
+    weight_grad_cost_constraints=2e-1,
+    weight_grad_cost_soft_constraints=2e-2,
+    factor_num_interpolated_points_for_collision=1.5,
+    trajectory_duration=5.0,
+    device='cuda',
+    debug=False,
+    seed=18,
+    results_dir='logs',
+    trained_models_dir=str(base / 'data_trained_models'),
+    n_samples=4,
+    n_local_inference_noising_steps=3,
+    n_local_inference_denoising_steps=3,
+    env_scale=1.0,
+    horizon=64,
+)
+result = planner(planner.start_state_pos, planner.goal_state_pos)
+print('BASE_SMOKE_OK', result.trajs_final.shape, None if result.trajs_final_free is None else result.trajs_final_free.shape)
+PY
+```
+
+Observed result:
+
+- planner initialized successfully
+- diffusion sampling completed successfully
+- output shape: `trajs_final = [4, 64, 4]`
+- collision-free trajectories found: `trajs_final_free = [1, 64, 4]`
+
+#### Smoke Test 2: ControlNet MPD Path
+
+Exact command used:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+from einops._torch_specific import allow_ops_in_compiled_graph
+from mmd.planners.single_agent.mpd import MPD
+
+allow_ops_in_compiled_graph()
+base = Path('/home/dsi/yefimnu/diffusion_projects/mmd')
+planner = MPD(
+    model_id='EnvConveyor2D-RobotPlanarDisk',
+    planner_alg='mmd',
+    start_state_pos=None,
+    goal_state_pos=None,
+    use_guide_on_extra_objects_only=False,
+    start_guide_steps_fraction=0.5,
+    n_guide_steps=1,
+    n_diffusion_steps_without_noise=1,
+    weight_grad_cost_collision=2e-2,
+    weight_grad_cost_smoothness=8e-2,
+    weight_grad_cost_constraints=2e-1,
+    weight_grad_cost_soft_constraints=2e-2,
+    factor_num_interpolated_points_for_collision=1.5,
+    trajectory_duration=5.0,
+    device='cuda',
+    debug=False,
+    seed=18,
+    results_dir='logs',
+    trained_models_dir=str(base / 'data_trained_models'),
+    n_samples=4,
+    n_local_inference_noising_steps=3,
+    n_local_inference_denoising_steps=3,
+    env_scale=1.2,
+    horizon=64,
+    controlnet_checkpoint_path=str(base / 'logs_controlnet_full/0/checkpoints/ema_controlnet_final_state_dict.pth'),
+    sdf_cache_dir=str(base / 'data_trained_models/EnvConveyor2D-RobotPlanarDisk/controlnet/sdf_cache'),
+    control_scale=1.0,
+)
+result = planner(planner.start_state_pos, planner.goal_state_pos)
+print('CONTROLNET_SMOKE_OK', result.trajs_final.shape, None if result.trajs_final_free is None else result.trajs_final_free.shape)
+PY
+```
+
+Observed result:
+
+- ControlNet checkpoint loaded successfully
+- cached SDF for `env_scale=1.20` loaded successfully
+- wrapper path executed inside MPD inference successfully
+- output shape: `trajs_final = [4, 64, 4]`
+- collision-free trajectories found: `trajs_final_free = [4, 64, 4]`
+
+These smoke tests validate that the integration is operational. The next step is a proper base-vs-ControlNet evaluation sweep using the original inference parameters from `mmd/config/mmd_params.py`.
+
+---
+
+## 14. Benchmark Evaluation Plan (Best Hyperparameter Baseline vs ControlNet)
+
+This section records the planned benchmark used to compare the trained ControlNet adapter against the strongest known non-ControlNet inference configuration for scaled Conveyor environments.
+
+### Purpose
+
+The benchmark goal is not to prove ControlNet must help. It is to measure whether the current FiLM-based adapter changes multi-agent planning quality in a meaningful way when compared against the best hyperparameter setting already found by grid search for scaled environments.
+
+This is an intentionally conservative comparison:
+
+- same planning problem family
+- same random seeds
+- same start/goal generation per scale
+- same guidance hyperparameters
+- same runtime limit
+- only the presence/absence of ControlNet changes
+
+### Baseline Configuration to Beat
+
+From the completed grid search and result summaries (`scripts/inference/best_hyperparameter_configs.txt`), the strongest average configuration for scaled Conveyor experiments was:
+
+| Parameter | Value |
+|-----------|-------|
+| `weight_grad_cost_collision` | `0.05` |
+| `weight_grad_cost_smoothness` | `0.08` |
+| `weight_grad_cost_constraints` | `0.2` |
+| `weight_grad_cost_soft_constraints` | `0.01` |
+| `start_guide_steps_fraction` | `0.35` |
+
+This configuration will be used unchanged for both:
+
+1. base MPD benchmark runs
+2. ControlNet-augmented MPD benchmark runs
+
+### Benchmark Scope
+
+The experiment matrix is:
+
+| Dimension | Values |
+|-----------|--------|
+| Planning problem | `EnvConveyor2DRobotPlanarDiskRandom` |
+| Scales | `1.0, 1.1, 1.2, 1.3, 1.4` |
+| Agent counts | `6, 9, 12, 15` |
+| Trials per combination | `10` |
+| Runtime limit | `180 s` |
+| Base modes | `base`, `controlnet` |
+| Control strength | `control_scale = 1.0` |
+
+Scale `1.5` is intentionally excluded from this first benchmark sweep because prior experiments already showed near-universal failure there, making it a poor first comparison point.
+
+### ControlNet Checkpoints to Evaluate
+
+Two ControlNet checkpoints will be compared against the same base baseline:
+
+1. `logs_controlnet_full/0/checkpoints/ema_controlnet_final_state_dict.pth`
+2. `logs_controlnet_full/0/checkpoints/controlnet_epoch_0333_iter_030000_state_dict.pth`
+
+Rationale:
+
+- the EMA final checkpoint is the default inference choice
+- the `iter_030000` checkpoint is closest to the best validation region and may generalize better if late-training overfitting matters
+
+### Total Trial Count
+
+Per planner variant:
+
+- `5 scales x 4 agent counts x 10 trials = 200 trials`
+
+Full benchmark total:
+
+- base MPD: `200`
+- ControlNet + EMA: `200`
+- ControlNet + best-val checkpoint: `200`
+- overall total: `600 trials`
+
+### Why the Comparison Must Re-run the Base Mode
+
+Although prior baseline data already exists from grid search, the benchmark should re-run the base planner in the same launcher used for ControlNet so that:
+
+- `fix_random_seed(...)` is applied identically before each `(scale, mode)` pair
+- base and ControlNet see the same generated start/goal sets
+- differences in results are attributable to the model path, not to different sampled planning problems
+
+This makes the benchmark a paired comparison rather than a loose comparison across historical runs.
+
+### Expected Outcome / Hypothesis
+
+Current expectations remain cautious.
+
+The implemented ControlNet uses a **global FiLM-style conditioning signal** (`sdf_emb` added to the time embedding), not cross-attention or per-waypoint spatial conditioning. That means the conditioning is much less expressive than original image-domain ControlNet, where the condition and latent share strong spatial correspondence.
+
+So the most likely outcomes, in order of expectation, are:
+
+1. **neutral or slightly worse** than the tuned base configuration
+2. **small gains at larger scales** (`1.3` to `1.4`) if the global SDF signal helps obstacle-awareness enough to reduce CBS burden
+3. **clear gains across all scales**, which would be surprising but valuable if observed
+
+Even a negative result is useful here because it would support the hypothesis that global FiLM conditioning is too weak for this cross-domain setting.
+
+### Metrics to Compare
+
+The benchmark will compare the standard aggregated experiment outputs already produced by the MAPF pipeline:
+
+- `success_rate`
+- `avg_planning_time`
+- `avg_ct_expansions`
+- `avg_num_collisions_in_solution`
+- `avg_path_length_per_agent`
+- `avg_mean_path_acceleration_per_agent`
+- `avg_data_adherence`
+- failure rates (`runtime_limit`, `no_solution`, `collision_agents`)
+
+Primary decision metric:
+
+- `success_rate` as a function of `env_scale` and `num_agents`
+
+Secondary interpretation metrics:
+
+- planning time and CT expansions (does ControlNet reduce CBS search burden?)
+- path quality metrics (does it change trajectory realism/smoothness?)
+
+### Launcher Design Decision
+
+The benchmark launcher should **reuse existing code** rather than duplicating experiment logic.
+
+Existing scripts reviewed:
+
+- `scripts/inference/launch_grid_search.py`
+  - reused as the pattern for generating shell scripts and batching experiment commands
+- `scripts/inference/launch_controlnet_evaluation.py`
+  - reused as the actual execution entry point for base-vs-ControlNet comparisons
+- `scripts/inference/launch_multi_agent_experiment.py`
+  - reused indirectly through `launch_controlnet_evaluation.py`
+
+Decision:
+
+- add a new thin script: `scripts/inference/launch_controlnet_benchmark.py`
+- it should generate benchmark shell scripts rather than re-implement the experiment runner
+- full benchmark launching remains manual/user-controlled
+
+### Planned GPU Distribution
+
+Machine state at planning time: `2 x A100 80GB` available.
+
+Recommended split:
+
+- **GPU 0**: base benchmark (`200` trials)
+- **GPU 1**: ControlNet benchmark (`400` trials), running:
+  1. EMA checkpoint
+  2. best-val checkpoint
+
+This avoids memory contention while still parallelizing the full sweep.
+
+### Benchmark Script Behavior
+
+The benchmark launcher should generate scripts under `scripts/inference/gpu_scripts/` and point all experiment outputs to the shared inference results root:
+
+- `scripts/inference/results/`
+
+Expected generated shell scripts:
+
+- `scripts/inference/gpu_scripts/controlnet_benchmark_gpu0.sh`
+- `scripts/inference/gpu_scripts/controlnet_benchmark_gpu1.sh`
+
+The generated commands should call `launch_controlnet_evaluation.py` with:
+
+- fixed winning hyperparameters
+- `--num_agents 6 9 12 15`
+- `--scales 1.0 1.1 1.2 1.3 1.4`
+- `--num_trials_per_combination 10`
+- `--runtime_limit 180`
+- `--modes base` or `--modes controlnet`
+- `--control_scale 1.0`
+- the selected checkpoint path for ControlNet runs
+
+### Planned Smoke Validation Before Full Launch
+
+Only smoke validation should be executed automatically before handing the full launcher to the user.
+
+Recommended smoke checks:
+
+1. launcher dry-run / script-generation check
+2. syntax check of the new launcher
+3. optional tiny benchmark smoke command with reduced scope:
+   - one scale
+   - one agent count
+   - one trial
+
+The full benchmark itself should be started manually by the user after inspecting the generated scripts.
+
+### Benchmark Launcher Implementation (Completed)
+
+The benchmark launcher has now been added at:
+
+- `scripts/inference/launch_controlnet_benchmark.py`
+
+Implementation notes:
+
+- it reuses `launch_controlnet_evaluation.py` as the execution entry point
+- it hardcodes the winning Conveyor hyperparameters as the benchmark default
+- it writes GPU-specific shell scripts instead of launching experiments automatically
+- it writes a manifest file summarizing the full benchmark matrix, checkpoints, and exact commands
+- GIF rendering is disabled by default via `--no_render_animation` to keep the benchmark focused on metrics rather than visualization overhead
+
+Generated artifacts:
+
+- `scripts/inference/gpu_scripts/controlnet_benchmark_gpu0.sh`
+- `scripts/inference/gpu_scripts/controlnet_benchmark_gpu1.sh`
+- `scripts/inference/gpu_scripts/controlnet_benchmark_manifest.txt`
+
+GPU role split encoded by the generated scripts:
+
+- `controlnet_benchmark_gpu0.sh` -> base benchmark
+- `controlnet_benchmark_gpu1.sh` -> ControlNet benchmark (EMA then best-val checkpoint)
+
+### Smoke Validation Executed for the Launcher
+
+The following smoke checks were run after implementing the launcher:
+
+#### 1. Python syntax check
+
+```bash
+python3 -m py_compile scripts/inference/launch_controlnet_benchmark.py
+```
+
+Result:
+
+- passed
+
+#### 2. Dry-run generation check
+
+```bash
+python3 scripts/inference/launch_controlnet_benchmark.py --dry_run
+```
+
+Result:
+
+- printed the expected 3 benchmark commands
+- confirmed benchmark scope: scales `[1.0, 1.1, 1.2, 1.3, 1.4]`, agents `[6, 9, 12, 15]`, `10` trials per combination
+- confirmed base / ControlNet command separation
+- confirmed `--no_render_animation` is passed by default
+
+#### 3. Actual script-generation smoke run
+
+```bash
+python3 scripts/inference/launch_controlnet_benchmark.py
+```
+
+Result:
+
+- generated both GPU shell scripts successfully
+- generated the benchmark manifest successfully
+- did **not** launch the full benchmark itself
+
+#### 4. Generated shell syntax check
+
+```bash
+bash -n scripts/inference/gpu_scripts/controlnet_benchmark_gpu0.sh && \
+bash -n scripts/inference/gpu_scripts/controlnet_benchmark_gpu1.sh
+```
+
+Result:
+
+- both generated shell scripts passed syntax validation
+
+### Manual Launch Commands
+
+When ready to run the full benchmark manually:
+
+```bash
+bash scripts/inference/gpu_scripts/controlnet_benchmark_gpu0.sh
+bash scripts/inference/gpu_scripts/controlnet_benchmark_gpu1.sh
+```
+
+These commands intentionally remain manual/user-triggered.
