@@ -44,6 +44,9 @@ from torch_robotics.robots import *
 from mmd.config.mmd_experiment_configs import get_planning_problem
 
 
+RESULTS_BASE_DIR = Path(__file__).resolve().parents[3] / 'scripts' / 'inference' / 'results'
+
+
 class MultiAgentPlanningExperimentConfig:
     # The time string. The result directory is automatically created based on the config and this string.
     time_str: str = None
@@ -68,6 +71,10 @@ class MultiAgentPlanningExperimentConfig:
     env_scale: float = None
     # Optional hyperparameter overrides for gradient guidance and sampling
     hyperparam_overrides: dict = None
+    # Optional ControlNet inference configuration
+    controlnet_checkpoint_path: str = None
+    sdf_cache_dir: str = None
+    control_scale: float = 1.0
 
     def get_single_trial_configs_from_experiment_config(self):
         single_trial_configs = []
@@ -96,6 +103,9 @@ class MultiAgentPlanningExperimentConfig:
                     single_trial_config.render_animation = self.render_animation
                     single_trial_config.env_scale = self.env_scale
                     single_trial_config.hyperparam_overrides = self.hyperparam_overrides
+                    single_trial_config.controlnet_checkpoint_path = self.controlnet_checkpoint_path
+                    single_trial_config.sdf_cache_dir = self.sdf_cache_dir
+                    single_trial_config.control_scale = self.control_scale
                     single_trial_config.start_state_pos_l, single_trial_config.goal_state_pos_l, \
                         single_trial_config.global_model_ids, single_trial_config.agent_skeleton_l = \
                         start_state_pos_l_l[trial_number], goal_state_pos_l_l[trial_number], \
@@ -148,6 +158,10 @@ class MultiAgentPlanningSingleTrialConfig:
     env_scale: float = None
     # Optional hyperparameter overrides for gradient guidance and sampling
     hyperparam_overrides: dict = None
+    # Optional ControlNet inference configuration
+    controlnet_checkpoint_path: str = None
+    sdf_cache_dir: str = None
+    control_scale: float = 1.0
     # The starts and goals, models ids, and skeletons.
     start_state_pos_l = []
     goal_state_pos_l = []
@@ -252,7 +266,7 @@ class MultiAgentPlanningSingleTrialResult:
 # Utility functions.
 def get_result_dir_from_time_str(time_str: str):
     # Create a results directory.
-    results_dir = os.path.join('./results', f'{time_str}')
+    results_dir = os.path.join(os.fspath(RESULTS_BASE_DIR), f'{time_str}')
     results_dir = os.path.abspath(results_dir)
     return results_dir
 

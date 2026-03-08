@@ -86,6 +86,9 @@ class MPD(SingleAgentPlanner):
                  n_local_inference_denoising_steps: int,
                  env_scale: float = None,
                  horizon: int = None,
+                 controlnet_checkpoint_path: str = None,
+                 sdf_cache_dir: str = None,
+                 control_scale: float = 1.0,
                  **kwargs
                  ):
         super().__init__()
@@ -121,12 +124,17 @@ class MPD(SingleAgentPlanner):
 
         args = load_params_from_yaml(os.path.join(model_dir, "args.yaml"))
 
+        if controlnet_checkpoint_path is None and sdf_cache_dir is not None:
+            raise ValueError('sdf_cache_dir was provided without controlnet_checkpoint_path.')
+        if controlnet_checkpoint_path is not None and sdf_cache_dir is None:
+            raise ValueError('controlnet_checkpoint_path requires sdf_cache_dir to be provided.')
+
         ####################################
         # Load dataset with env, robot, task. The TrajectoryDataset type is used here.
         train_subset, train_dataloader, val_subset, val_dataloader = get_dataset(
             dataset_class='TrajectoryDataset',
             use_extra_objects=True,
-            obstacle_cutoff_margin=0.05,
+            obstacle_cutoff_margin=0.01,
             env_scale=env_scale,
             **args,
             tensor_args=tensor_args
@@ -174,6 +182,48 @@ class MPD(SingleAgentPlanner):
                        map_location=tensor_args['device'])
         )
         diffusion_model.eval()
+
+        if controlnet_checkpoint_path is not None:
+            from mmd.models.diffusion_models.controlnet import MMDControlNet, ControlNetInferenceWrapper
+            from mmd.models.helpers.map_encoder import resize_sdf
+
+            controlnet = MMDControlNet(base_model=diffusion_model.model)
+            controlnet = controlnet.to(device=tensor_args['device'])
+            controlnet.load_state_dict(
+                torch.load(controlnet_checkpoint_path, map_location=tensor_args['device'])
+            )
+            controlnet.eval()
+
+            scale = 1.0 if env_scale is None else env_scale
+            scale = round(scale * 100) / 100.0
+            sdf_path = os.path.join(sdf_cache_dir, f'sdf_scale_{scale:.2f}.pt')
+            if not os.path.exists(sdf_path):
+                raise FileNotFoundError(
+                    f'Could not find cached SDF for env_scale={scale:.2f} at {sdf_path}'
+                )
+
+            sdf_grid = torch.load(sdf_path, map_location=tensor_args['device'])
+            if isinstance(sdf_grid, dict):
+                if 'sdf' not in sdf_grid:
+                    raise ValueError(
+                        f"Cached SDF file at {sdf_path} is a dict but has no 'sdf' key. "
+                        f"Keys: {sorted(sdf_grid.keys())}"
+                    )
+                sdf_grid = sdf_grid['sdf']
+            sdf_grid = resize_sdf(sdf_grid, target_size=64).to(**tensor_args)
+
+            diffusion_model.model = ControlNetInferenceWrapper(
+                base_model=diffusion_model.model,
+                controlnet=controlnet,
+                sdf_grid=sdf_grid,
+                control_scale=control_scale,
+            )
+            diffusion_model.eval()
+
+            print(f'[MPD] Loaded ControlNet checkpoint: {controlnet_checkpoint_path}')
+            print(f'[MPD] Loaded cached SDF: {sdf_path}')
+            print(f'[MPD] Using control scale: {control_scale:.3f}')
+
         model = diffusion_model
 
         freeze_torch_model_params(model)

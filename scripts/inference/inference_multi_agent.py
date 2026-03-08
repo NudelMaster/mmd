@@ -123,6 +123,9 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
         'results_dir': params.results_dir,
         'trained_models_dir': TRAINED_MODELS_DIR,
         'env_scale': test_config.env_scale,
+        'controlnet_checkpoint_path': test_config.controlnet_checkpoint_path,
+        'sdf_cache_dir': test_config.sdf_cache_dir,
+        'control_scale': test_config.control_scale,
     }
     high_level_planner_model_args = {
         'is_xcbs': True if test_config.multi_agent_planner_class in ["XECBS", "XCBS"] else False,
@@ -171,6 +174,8 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
     if test_config.single_agent_planner_class == "MPD":
         low_level_planner_class = MPD
     elif test_config.single_agent_planner_class == "MPDEnsemble":
+        if test_config.controlnet_checkpoint_path is not None:
+            raise ValueError('ControlNet inference is currently supported only for MPD, not MPDEnsemble.')
         low_level_planner_class = MPDEnsemble
     else:
         raise ValueError(f'Unknown single agent planner class: {test_config.single_agent_planner_class}')
@@ -413,8 +418,8 @@ if __name__ == '__main__':
         # Choose the model to use. A model is for a map/robot combination.
         #test_config_single_tile.global_model_ids = [['EnvEmpty2D-RobotPlanarDisk']]
         #test_config_single_tile.global_model_ids = [['EnvEmptyNoWait2D-RobotPlanarDisk']]
-        #test_config_single_tile.global_model_ids = [['EnvConveyor2D-RobotPlanarDisk']]
-        test_config_single_tile.global_model_ids = [['EnvHighways2D-RobotPlanarDisk']]
+        test_config_single_tile.global_model_ids = [['EnvConveyor2D-RobotPlanarDisk']]
+        #test_config_single_tile.global_model_ids = [['EnvHighways2D-RobotPlanarDisk']]
         #test_config_single_tile.global_model_ids = [['EnvDropRegion2D-RobotPlanarDisk']]
 
         # Choose starts and goals.
@@ -422,10 +427,9 @@ if __name__ == '__main__':
         torch.random.manual_seed(10)
         test_config_single_tile.start_state_pos_l, test_config_single_tile.goal_state_pos_l = \
         get_start_goal_pos_random_in_env(test_config_single_tile.num_agents,
-                                         EnvHighways2D,
+                                         EnvConveyor2D,
                                          tensor_args,
-                                         margin=0.2,
-                                         obstacle_margin=0.05)
+                                         )
         
         # (torch.tensor([[-0.25, -0.5],
         #                [ 0,  -0.5],

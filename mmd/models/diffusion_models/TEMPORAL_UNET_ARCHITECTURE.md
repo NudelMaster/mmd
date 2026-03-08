@@ -1386,6 +1386,7 @@ Implementation notes:
 - it reuses `launch_controlnet_evaluation.py` as the execution entry point
 - it hardcodes the winning Conveyor hyperparameters as the benchmark default
 - it writes GPU-specific shell scripts instead of launching experiments automatically
+- it now also writes a tmux launcher so the long benchmark can be launched the same way as the earlier hyperparameter sweeps
 - it writes a manifest file summarizing the full benchmark matrix, checkpoints, and exact commands
 - GIF rendering is disabled by default via `--no_render_animation` to keep the benchmark focused on metrics rather than visualization overhead
 
@@ -1393,12 +1394,14 @@ Generated artifacts:
 
 - `scripts/inference/gpu_scripts/controlnet_benchmark_gpu0.sh`
 - `scripts/inference/gpu_scripts/controlnet_benchmark_gpu1.sh`
+- `scripts/inference/gpu_scripts/launch_controlnet_benchmark_tmux.sh`
 - `scripts/inference/gpu_scripts/controlnet_benchmark_manifest.txt`
 
 GPU role split encoded by the generated scripts:
 
 - `controlnet_benchmark_gpu0.sh` -> base benchmark
 - `controlnet_benchmark_gpu1.sh` -> ControlNet benchmark (EMA then best-val checkpoint)
+- `launch_controlnet_benchmark_tmux.sh` -> detached tmux launcher that starts one session per GPU worker and keeps the shell open after completion for inspection
 
 ### Smoke Validation Executed for the Launcher
 
@@ -1436,6 +1439,7 @@ python3 scripts/inference/launch_controlnet_benchmark.py
 Result:
 
 - generated both GPU shell scripts successfully
+- generated the tmux launcher script successfully
 - generated the benchmark manifest successfully
 - did **not** launch the full benchmark itself
 
@@ -1443,16 +1447,25 @@ Result:
 
 ```bash
 bash -n scripts/inference/gpu_scripts/controlnet_benchmark_gpu0.sh && \
-bash -n scripts/inference/gpu_scripts/controlnet_benchmark_gpu1.sh
+bash -n scripts/inference/gpu_scripts/controlnet_benchmark_gpu1.sh && \
+bash -n scripts/inference/gpu_scripts/launch_controlnet_benchmark_tmux.sh
 ```
 
 Result:
 
-- both generated shell scripts passed syntax validation
+- all generated shell scripts passed syntax validation
 
 ### Manual Launch Commands
 
 When ready to run the full benchmark manually:
+
+```bash
+bash scripts/inference/gpu_scripts/launch_controlnet_benchmark_tmux.sh
+tmux attach -t controlnet_benchmark_gpu0
+tmux attach -t controlnet_benchmark_gpu1
+```
+
+If tmux is not desired, the direct scripts still work:
 
 ```bash
 bash scripts/inference/gpu_scripts/controlnet_benchmark_gpu0.sh
@@ -1460,3 +1473,252 @@ bash scripts/inference/gpu_scripts/controlnet_benchmark_gpu1.sh
 ```
 
 These commands intentionally remain manual/user-triggered.
+
+### Benchmark Launch Fix: Invalid Random Start/Goal States (Completed)
+
+After the first tmux benchmark launch, both workers could terminate early with:
+
+```text
+ValueError: Start or goal states are invalid.
+```
+
+Root cause:
+
+- `EnvConveyor2DRobotPlanarDiskRandom` sampled random positions with `obstacle_margin=0.08`
+- the benchmark now uses single-agent `MPD`, whose task loader hardcodes `obstacle_cutoff_margin=0.05`
+- with `RobotPlanarDisk` collision margin `0.055`, the effective MPD safety margin is about `0.105`, so some sampled states that were acceptable for earlier `MPDEnsemble`-style experiments were rejected by CBS startup validation under `MPD`
+
+Fix decision after deeper review:
+
+- the first attempted fix added retry/validation logic in `mmd/common/multi_agent_utils.py` and tighter sampling in `mmd/config/mmd_experiment_configs.py`
+- that approach was intentionally **reverted** because it changed shared random problem generation behavior, which would weaken comparability with the earlier benchmark runs
+- the real mismatch was not the sampler itself; it was that the benchmark now used `MPD` while the earlier grid-search experiments used `MPDEnsemble`
+- `MPDEnsemble` loads its task with `obstacle_cutoff_margin=0.01`, while `MPD` used `0.05`
+
+Final minimal fix kept in code:
+
+- `mmd/planners/single_agent/mpd.py`
+  - changed `obstacle_cutoff_margin` from `0.05` to `0.01`
+- `mmd/common/multi_agent_utils.py`
+  - reverted to the original implementation (no whole-set retry logic kept)
+- `mmd/config/mmd_experiment_configs.py`
+  - reverted to the original Conveyor random sampling path (no special validation hook kept)
+
+Why this matches the earlier benchmark behavior:
+
+- `RobotPlanarDisk` contributes collision margin `0.055`
+- with `MPD` at `0.05`, the effective task collision margin was about `0.105`
+- with `MPDEnsemble` at `0.01`, the effective task collision margin is about `0.065`
+- after the one-line `MPD` change, CBS start/goal validation and obstacle guidance now use the same margin convention as `MPDEnsemble`, which is the behavior the earlier grid search actually measured
+
+Smoke validation executed after the final minimal fix:
+
+```bash
+python3 scripts/inference/launch_controlnet_evaluation.py \
+  --modes base \
+  --scales 1.2 \
+  --num_agents 6 \
+  --num_trials_per_combination 1 \
+  --runtime_limit 60 \
+  --no_render_animation \
+  --weight_grad_cost_collision 0.05 \
+  --weight_grad_cost_smoothness 0.08 \
+  --weight_grad_cost_constraints 0.2 \
+  --weight_grad_cost_soft_constraints 0.01 \
+  --start_guide_steps_fraction 0.35
+
+python3 scripts/inference/launch_controlnet_evaluation.py \
+  --modes controlnet \
+  --scales 1.2 \
+  --num_agents 6 \
+  --num_trials_per_combination 1 \
+  --runtime_limit 60 \
+  --no_render_animation \
+  --weight_grad_cost_collision 0.05 \
+  --weight_grad_cost_smoothness 0.08 \
+  --weight_grad_cost_constraints 0.2 \
+  --weight_grad_cost_soft_constraints 0.01 \
+  --start_guide_steps_fraction 0.35
+```
+
+Observed result:
+
+- base smoke run completed successfully at `env_scale=1.2`, `num_agents=6`, `success_rate=1.0`, `avg_planning_time=10.91s`, `avg_ct_expansions=1.0`
+- ControlNet smoke run completed successfully at `env_scale=1.2`, `num_agents=6`, `success_rate=1.0`, `avg_planning_time=11.31s`, `avg_ct_expansions=1.0`
+- no `Start or goal states are invalid` failure occurred in either mode
+- the existing benchmark launcher scripts remain valid; no regeneration was required for this fix
+
+### Benchmark Result Folder Identification Metadata (Completed)
+
+The timestamped results folders were hard to interpret after the benchmark because the directory name itself did not encode whether a run was:
+
+- `base`
+- `controlnet_ema`
+- `controlnet_bestval`
+
+Minimal fix implemented:
+
+- `scripts/inference/launch_controlnet_evaluation.py`
+  - added optional `--run_label`
+  - writes `run_metadata.json` into each run root at:
+    - `scripts/inference/results/<time_str>/instance_name___.../run_metadata.json`
+  - metadata includes:
+    - `run_label`
+    - `mode`
+    - `time_str`
+    - `results_dir`
+    - ControlNet checkpoint info (when applicable)
+    - full CLI args / `argv`
+- `scripts/inference/launch_controlnet_benchmark.py`
+  - now generates benchmark commands with explicit labels:
+    - `--run_label base`
+    - `--run_label controlnet_ema`
+    - `--run_label controlnet_bestval`
+  - regenerated shell scripts and manifest now preserve that labeling end-to-end
+
+Practical consequence:
+
+- after the benchmark finishes, open any timestamped result folder and inspect `run_metadata.json` to identify exactly which experiment produced it
+- this avoids relying on timestamp ordering or tmux scrollback
+
+Smoke validation command for metadata:
+
+```bash
+python3 scripts/inference/launch_controlnet_evaluation.py \
+  --instance_name EnvConveyor2DRobotPlanarDiskRandom \
+  --run_label metadata_smoke \
+  --modes base \
+  --scales 1.2 \
+  --num_agents 3 \
+  --num_trials_per_combination 1 \
+  --multi_agent_planner_classes XECBS \
+  --runtime_limit 60 \
+  --stagger_start_time_dt 0 \
+  --seed 18 \
+  --no_render_animation
+```
+
+Observed result:
+
+- the run completed successfully
+- `run_metadata.json` was written to the run root
+- the metadata correctly recorded `run_label=metadata_smoke`, `mode=base`, and the generated `time_str`
+
+Status update:
+
+- the full benchmark was launched and completed after this setup
+- results and analysis are recorded in Section 15
+
+---
+
+## 15. First Benchmark Results (Completed, But ControlNet Hyperparameters Were Wrong)
+
+This section documents the completed 600-trial benchmark run from the result folders starting at `2026-03-07-21-06-50`.
+
+### Important Experimental Caveat
+
+All three modes used the same **grid-search-winning** hyperparameters:
+
+- `weight_grad_cost_collision=0.05`
+- `weight_grad_cost_smoothness=0.08`
+- `weight_grad_cost_constraints=0.2`
+- `weight_grad_cost_soft_constraints=0.01`
+- `start_guide_steps_fraction=0.35`
+
+This is valid for the base baseline, but it is **not** the intended setup for ControlNet isolation. ControlNet runs should use paper defaults (Section 16).
+
+### Run Mapping
+
+- `evaluation_id=2026-03-07-21-06-50`, PID `1857416` -> `run_label=base`
+- `evaluation_id=2026-03-07-21-06-50`, PID `1857417` -> `run_label=controlnet_ema`
+- `evaluation_id=2026-03-08-00-16-44`, PID `1881242` -> `run_label=controlnet_bestval`
+
+Each mode includes scales `1.0..1.4`, agent counts `6/9/12/15`, and `10` trials per combination.
+
+### Result Folder Completeness Check
+
+The benchmark artifacts are complete and usable:
+
+- `15/15` run folders contain `run_metadata.json`
+- `15/15` run folders contain `aggregated_results_all_agents.csv`
+- `15/15` run folders contain all four per-agent CSVs (`6/9/12/15`)
+- Trial outputs exist for all combinations; one visualization-only artifact is missing:
+  - `base`, `env_scale=1.4`, `num_agents=15`, trial `5` missing `mmd_single_trial.gif.png`
+  - numeric trial outputs (`results.pkl`, `results.txt`, `config.pkl`) are present
+
+### 15-Agent Comparison by Scale
+
+| Mode | Scale | Success | Avg CT Expansions | Avg Planning Time (s) | Avg Path Length/Agent | Avg Acceleration/Agent |
+|------|-------|---------|-------------------|------------------------|-----------------------|------------------------|
+| base | 1.0 | 1.00 | 18.8 | 56.57 | 3.683 | 0.163 |
+| base | 1.1 | 1.00 | 15.1 | 50.35 | 3.629 | 0.155 |
+| base | 1.2 | 1.00 | 14.6 | 47.83 | 3.906 | 0.160 |
+| base | 1.3 | 1.00 | 26.4 | 66.78 | 4.321 | 0.205 |
+| base | 1.4 | 0.90 | 31.1 | 72.63 | 4.391 | 0.215 |
+| controlnet_ema | 1.0 | 1.00 | 11.3 | 44.55 | 3.465 | 0.144 |
+| controlnet_ema | 1.1 | 1.00 | 9.6 | 42.13 | 3.566 | 0.147 |
+| controlnet_ema | 1.2 | 1.00 | 11.0 | 45.07 | 3.779 | 0.156 |
+| controlnet_ema | 1.3 | 1.00 | 15.1 | 53.34 | 3.974 | 0.172 |
+| controlnet_ema | 1.4 | 1.00 | 15.8 | 56.37 | 4.046 | 0.175 |
+| controlnet_bestval | 1.0 | 1.00 | 11.2 | 44.22 | 3.518 | 0.149 |
+| controlnet_bestval | 1.1 | 1.00 | 12.3 | 47.83 | 3.717 | 0.162 |
+| controlnet_bestval | 1.2 | 1.00 | 10.9 | 44.78 | 3.808 | 0.157 |
+| controlnet_bestval | 1.3 | 1.00 | 11.7 | 46.54 | 3.788 | 0.156 |
+| controlnet_bestval | 1.4 | 1.00 | 15.5 | 53.37 | 4.033 | 0.177 |
+
+### Cross-Scale Means (All 20 combinations per mode)
+
+| Mode | Mean Success | Mean CT Expansions | Mean Planning Time (s) | Mean Path Length/Agent | Mean Acceleration/Agent | Mean Runtime-Limit Fail Rate |
+|------|--------------|--------------------|------------------------|------------------------|-------------------------|------------------------------|
+| base | 0.995 | 9.26 | 30.22 | 3.680 | 0.146 | 0.005 |
+| controlnet_ema | 1.000 | 6.24 | 27.53 | 3.615 | 0.142 | 0.000 |
+| controlnet_bestval | 1.000 | 6.05 | 27.26 | 3.616 | 0.142 | 0.000 |
+
+### What This First Benchmark Shows
+
+Even with the wrong ControlNet hyperparameter policy, the signal is consistent:
+
+1. ControlNet modes require fewer CBS CT expansions (especially at scales `1.3` and `1.4`).
+2. ControlNet modes reduce planning time at higher scales.
+3. Base mode has one runtime-limit failure at `scale=1.4, agents=15`; both ControlNet modes remain at 100% success there.
+
+Concrete high-scale examples (15-agent rows):
+
+- At `scale=1.4`, CT expansions: base `31.1` vs EMA `15.8` vs best-val `15.5` (about 2x lower for ControlNet).
+- At `scale=1.4`, planning time: base `72.63s` vs EMA `56.37s` vs best-val `53.37s`.
+
+Interpretation caution: this benchmark still mixes two variables for ControlNet modes (adapter + non-default guidance settings), so it is not the final causal comparison.
+
+---
+
+## 16. Corrected ControlNet Re-Run Plan (Pending)
+
+To isolate ControlNet effect correctly:
+
+- keep base baseline from Section 15 as the strong reference
+- re-run only ControlNet modes with **paper defaults** from `mmd/config/mmd_params.py`
+- do not pass `--weight_grad_cost_*` or `--start_guide_steps_fraction` overrides for ControlNet runs
+
+### Corrected Re-Run Scope
+
+- Modes: `controlnet_ema_v2`, `controlnet_bestval_v2`
+- Scales: `1.0 1.1 1.2 1.3 1.4`
+- Agents: `6 9 12 15`
+- Trials per combination: `10`
+- Runtime limit: `180`
+- Total corrected trials: `400`
+
+### GPU Split for Corrected Re-Run
+
+- GPU 0: `controlnet_ema_v2` only
+- GPU 1: `controlnet_bestval_v2` only
+
+### Paper Defaults Used in Corrected ControlNet Runs
+
+- `weight_grad_cost_collision=0.02`
+- `weight_grad_cost_smoothness=0.08`
+- `weight_grad_cost_constraints=0.2`
+- `weight_grad_cost_soft_constraints=0.02`
+- `start_guide_steps_fraction=0.5`
+
+The benchmark launcher was updated so this corrected setup can be generated without manually editing command lines.

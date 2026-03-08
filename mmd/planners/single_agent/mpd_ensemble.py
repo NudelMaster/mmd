@@ -99,6 +99,10 @@ class MPDEnsemble(SingleAgentPlanner):
                  **kwargs
                  ):
         super().__init__()
+
+        if kwargs.get('controlnet_checkpoint_path') is not None or kwargs.get('sdf_cache_dir') is not None:
+            raise ValueError('ControlNet inference is currently supported only for MPD, not MPDEnsemble.')
+
         # The constraints are stored here. This is a list of ConstraintCost.
         self.constraints = []
         self.weight_grad_cost_constraints = weight_grad_cost_constraints
