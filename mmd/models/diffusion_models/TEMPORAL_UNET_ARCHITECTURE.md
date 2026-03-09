@@ -251,12 +251,13 @@ Encode SDF to `[B, 64, 256]` context tokens. Each trajectory position cross-atte
 | `scripts/generate_data/precompute_sdfs.py` | **Done** | SDF pre-computation |
 | `scripts/generate_data/generate_multiscale_data.py` | **Done (rewritten)** | Multi-scale trajectory generation aligned with `MMDParams` + inference defaults |
 
-### Remaining (Updated)
+### Status (Updated)
 
 | Priority | Task | Notes |
 |----------|------|-------|
-| **High** | Inference integration with MPD | Wire `ControlledDiffusionModel` into rollout/sampling path |
-| **High** | Base vs ControlNet evaluation | Compare metrics across scales 1.0 to 1.5 |
+| **Done** | Inference integration with MPD | Completed; see Section 13 |
+| **Done** | Base vs ControlNet evaluation | Completed; see Sections 15 to 17 |
+| **High** | Scale 1.5 stress-test | Add `env_scale=1.5` benchmark slice and document failure modes |
 | **Medium** | Overfitting mitigation study | Current run shows widening train/val gap after ~30K steps |
 | **Low** | Trainable vs frozen encoder optimization | Works as-is; optimize later if needed |
 
@@ -1181,7 +1182,7 @@ Observed result:
 - output shape: `trajs_final = [4, 64, 4]`
 - collision-free trajectories found: `trajs_final_free = [4, 64, 4]`
 
-These smoke tests validate that the integration is operational. The next step is a proper base-vs-ControlNet evaluation sweep using the original inference parameters from `mmd/config/mmd_params.py`.
+These smoke tests validated that the integration is operational. Full benchmark evaluations are now completed and documented in Sections 15 to 18.
 
 ---
 
@@ -1691,29 +1692,35 @@ Interpretation caution: this benchmark still mixes two variables for ControlNet 
 
 ---
 
-## 16. Corrected ControlNet Re-Run Plan (Pending)
+## 16. Corrected ControlNet Re-Run Results (Completed)
 
-To isolate ControlNet effect correctly:
+This section documents the corrected 400-trial ControlNet-only rerun that was executed after Section 15.
 
-- keep base baseline from Section 15 as the strong reference
-- re-run only ControlNet modes with **paper defaults** from `mmd/config/mmd_params.py`
-- do not pass `--weight_grad_cost_*` or `--start_guide_steps_fraction` overrides for ControlNet runs
-
-### Corrected Re-Run Scope
+### Corrected Protocol
 
 - Modes: `controlnet_ema_v2`, `controlnet_bestval_v2`
 - Scales: `1.0 1.1 1.2 1.3 1.4`
 - Agents: `6 9 12 15`
 - Trials per combination: `10`
 - Runtime limit: `180`
-- Total corrected trials: `400`
+- Total corrected trials: `400` (`2 x 5 x 4 x 10`)
 
-### GPU Split for Corrected Re-Run
+### Run Mapping
 
-- GPU 0: `controlnet_ema_v2` only
-- GPU 1: `controlnet_bestval_v2` only
+| Run label | PID | Number of folders | Scales covered |
+|-----------|-----|-------------------|----------------|
+| `controlnet_ema_v2` | `1985123` | 5 | `1.0..1.4` |
+| `controlnet_bestval_v2` | `1985124` | 5 | `1.0..1.4` |
 
-### Paper Defaults Used in Corrected ControlNet Runs
+### Default-Hyperparameter Verification
+
+All 10 corrected folders contain `run_metadata.json` with:
+
+- `hyperparam_overrides: null`
+- no `--weight_grad_cost_*` override flags in `argv`
+- no `--start_guide_steps_fraction` override in `argv`
+
+Therefore, corrected runs use default guidance values from `mmd/config/mmd_params.py`:
 
 - `weight_grad_cost_collision=0.02`
 - `weight_grad_cost_smoothness=0.08`
@@ -1721,4 +1728,115 @@ To isolate ControlNet effect correctly:
 - `weight_grad_cost_soft_constraints=0.02`
 - `start_guide_steps_fraction=0.5`
 
-The benchmark launcher was updated so this corrected setup can be generated without manually editing command lines.
+### 15-Agent Comparison by Scale (Corrected Runs)
+
+| Mode | Scale | Success | Avg CT Expansions | Avg Planning Time (s) | Avg Path Length/Agent | Avg Acceleration/Agent |
+|------|-------|---------|-------------------|------------------------|-----------------------|------------------------|
+| controlnet_ema_v2 | 1.0 | 1.00 | 9.3 | 43.58 | 3.353 | 0.138 |
+| controlnet_ema_v2 | 1.1 | 1.00 | 9.2 | 42.89 | 3.400 | 0.136 |
+| controlnet_ema_v2 | 1.2 | 1.00 | 8.6 | 42.42 | 3.601 | 0.139 |
+| controlnet_ema_v2 | 1.3 | 1.00 | 10.4 | 44.53 | 3.783 | 0.152 |
+| controlnet_ema_v2 | 1.4 | 1.00 | 19.5 | 58.06 | 4.042 | 0.176 |
+| controlnet_bestval_v2 | 1.0 | 1.00 | 9.2 | 42.45 | 3.381 | 0.140 |
+| controlnet_bestval_v2 | 1.1 | 1.00 | 9.0 | 42.20 | 3.450 | 0.140 |
+| controlnet_bestval_v2 | 1.2 | 1.00 | 10.3 | 44.90 | 3.645 | 0.145 |
+| controlnet_bestval_v2 | 1.3 | 1.00 | 10.3 | 44.17 | 3.834 | 0.159 |
+| controlnet_bestval_v2 | 1.4 | 1.00 | 10.7 | 44.83 | 3.846 | 0.156 |
+
+### Cross-Scale Means (All 20 combinations per mode)
+
+| Mode | Mean Success | Mean CT Expansions | Mean Planning Time (s) | Mean Path Length/Agent | Mean Acceleration/Agent | Mean Runtime-Limit Fail Rate |
+|------|--------------|--------------------|------------------------|------------------------|-------------------------|------------------------------|
+| controlnet_ema_v2 | 1.000 | 5.16 | 27.85 | 3.503 | 0.133 | 0.000 |
+| controlnet_bestval_v2 | 1.000 | 4.84 | 27.14 | 3.502 | 0.134 | 0.000 |
+
+### What the Corrected Re-Run Shows
+
+1. Both corrected modes maintain `100%` success across all scales and agent counts.
+2. Both corrected modes retain the main Section 15 signal: lower CT expansions and lower planning time than the strong base reference.
+3. `controlnet_bestval_v2` is more stable at the hardest setting (`scale=1.4`, `agents=15`): CT expansions `10.7` vs `19.5` for `controlnet_ema_v2`.
+4. The corrected rerun removes the hyperparameter-confound for ControlNet modes and becomes the primary ControlNet-vs-ControlNet checkpoint comparison.
+
+---
+
+## 17. Complete Experiment Summary (All Benchmark Runs)
+
+This section consolidates all benchmark results from:
+
+- Section 15: first 600-trial run (`base`, `controlnet_ema`, `controlnet_bestval`) with grid-search-winning guidance overrides
+- Section 16: corrected 400-trial run (`controlnet_ema_v2`, `controlnet_bestval_v2`) using defaults from `mmd/config/mmd_params.py`
+
+### Caveat on Baseline Comparability
+
+The corrected rerun intentionally did not include `base_v2` (base mode with default guidance). For final interpretation, we therefore use the Section 15 base run as the reference baseline and explicitly keep this caveat in mind.
+
+This is still a conservative baseline choice, because Section 15 base uses the strongest known non-ControlNet hyperparameter setting from grid search.
+
+### 15-Agent CT Expansions by Scale (All Variants)
+
+| Scale | base | controlnet_ema | controlnet_bestval | controlnet_ema_v2 | controlnet_bestval_v2 |
+|-------|------|----------------|--------------------|-------------------|-----------------------|
+| 1.0 | 18.8 | 11.3 | 11.2 | 9.3 | 9.2 |
+| 1.1 | 15.1 | 9.6 | 12.3 | 9.2 | 9.0 |
+| 1.2 | 14.6 | 11.0 | 10.9 | 8.6 | 10.3 |
+| 1.3 | 26.4 | 15.1 | 11.7 | 10.4 | 10.3 |
+| 1.4 | 31.1 | 15.8 | 15.5 | 19.5 | 10.7 |
+
+### 15-Agent Planning Time by Scale (All Variants)
+
+| Scale | base | controlnet_ema | controlnet_bestval | controlnet_ema_v2 | controlnet_bestval_v2 |
+|-------|------|----------------|--------------------|-------------------|-----------------------|
+| 1.0 | 56.57 | 44.55 | 44.22 | 43.58 | 42.45 |
+| 1.1 | 50.35 | 42.13 | 47.83 | 42.89 | 42.20 |
+| 1.2 | 47.83 | 45.07 | 44.78 | 42.42 | 44.90 |
+| 1.3 | 66.78 | 53.34 | 46.54 | 44.53 | 44.17 |
+| 1.4 | 72.63 | 56.37 | 53.37 | 58.06 | 44.83 |
+
+### Cross-Scale Means (All 20 combinations per variant)
+
+| Mode | Mean Success | Mean CT Expansions | Mean Planning Time (s) | Mean Path Length/Agent | Mean Acceleration/Agent | Mean Runtime-Limit Fail Rate |
+|------|--------------|--------------------|------------------------|------------------------|-------------------------|------------------------------|
+| base | 0.995 | 9.26 | 30.22 | 3.680 | 0.146 | 0.005 |
+| controlnet_ema | 1.000 | 6.24 | 27.53 | 3.615 | 0.142 | 0.000 |
+| controlnet_bestval | 1.000 | 6.05 | 27.26 | 3.616 | 0.142 | 0.000 |
+| controlnet_ema_v2 | 1.000 | 5.16 | 27.85 | 3.503 | 0.133 | 0.000 |
+| controlnet_bestval_v2 | 1.000 | 4.84 | 27.14 | 3.502 | 0.134 | 0.000 |
+
+### Key Findings
+
+1. Every ControlNet variant outperforms the base reference on mean CT expansions and mean planning time.
+2. At the hardest case (`scale=1.4`, `agents=15`), `controlnet_bestval_v2` shows the strongest result:
+   - CT expansions: `10.7` vs base `31.1` (about `65.6%` lower)
+   - planning time: `44.83s` vs base `72.63s` (about `38.3%` lower)
+   - success rate: `1.00` vs base `0.90`
+3. Corrected default-guidance runs (`*_v2`) are not weaker than the first ControlNet run; they improve mean CT expansions further.
+4. The best checkpoint for robustness is `controlnet_bestval_v2` (`controlnet_epoch_0333_iter_030000_state_dict.pth`) due to its more stable high-scale behavior.
+
+### Recommended Primary Result Set
+
+- **Primary non-ControlNet reference**: Section 15 `base` (strongest known baseline).
+- **Primary ControlNet result**: Section 16 `controlnet_bestval_v2`.
+- **Main claim**: ControlNet conditioning improves high-scale multi-agent planning under both tuned and default guidance policies.
+
+---
+
+## 18. Conclusions and Next Steps
+
+### Conclusions from Completed Experiments
+
+1. The global FiLM-style ControlNet adapter is effective in this cross-domain setting (2D SDF -> 1D trajectory diffusion), despite initial caution in Section 14.
+2. Improvements are largest where planning is hardest (higher scales, more agents), indicating that conditioning primarily helps reduce CBS search burden.
+3. The corrected rerun confirms that ControlNet gains are not tied to the earlier hyperparameter-overridden setup.
+
+### Implications for Architecture Decisions
+
+Section 6 deferred stronger spatial conditioning approaches (especially cross-attention / Approach A) because of complexity and base-model mismatch concerns.
+
+Given that the simpler global FiLM approach already improves outcomes, a stronger conditioning mechanism is now better motivated as a follow-up, not as a speculative detour.
+
+### Recommended Next Actions
+
+1. Keep `controlnet_bestval_v2` as the default inference checkpoint for Conveyor scaled experiments.
+2. Add a targeted `env_scale=1.5` benchmark slice to document the current failure boundary and identify where ControlNet stops helping.
+3. Run an ablation on control strength (`control_scale`: `0.5`, `1.0`, `1.5`) to verify whether high-scale gains can be increased further without harming low-scale behavior.
+4. If scale-1.5 performance remains weak, prototype Approach A (cross-attention conditioning) as the next architecture iteration.
