@@ -257,7 +257,7 @@ Encode SDF to `[B, 64, 256]` context tokens. Each trajectory position cross-atte
 |----------|------|-------|
 | **Done** | Inference integration with MPD | Completed; see Section 13 |
 | **Done** | Base vs ControlNet evaluation | Completed; see Sections 15 to 17 |
-| **High** | Scale 1.5 stress-test | Add `env_scale=1.5` benchmark slice and document failure modes |
+| **Done** | Scale 1.5 stress-test | Completed; see Sections 19 to 20 |
 | **Medium** | Overfitting mitigation study | Current run shows widening train/val gap after ~30K steps |
 | **Low** | Trainable vs frozen encoder optimization | Works as-is; optimize later if needed |
 
@@ -1837,6 +1837,183 @@ Given that the simpler global FiLM approach already improves outcomes, a stronge
 ### Recommended Next Actions
 
 1. Keep `controlnet_bestval_v2` as the default inference checkpoint for Conveyor scaled experiments.
-2. Add a targeted `env_scale=1.5` benchmark slice to document the current failure boundary and identify where ControlNet stops helping.
+2. ~~Add a targeted `env_scale=1.5` benchmark slice to document the current failure boundary and identify where ControlNet stops helping.~~ Completed; see Sections 19 to 20.
 3. Run an ablation on control strength (`control_scale`: `0.5`, `1.0`, `1.5`) to verify whether high-scale gains can be increased further without harming low-scale behavior.
-4. If scale-1.5 performance remains weak, prototype Approach A (cross-attention conditioning) as the next architecture iteration.
+4. Extend the benchmark to `env_scale=1.6` or `1.7` to locate the actual failure boundary before prototyping Approach A (cross-attention conditioning).
+
+---
+
+## 19. 1.5x Stress-Test Execution Plan
+
+This section records the next benchmark extension that follows directly from Section 18.
+
+### Scope
+
+- Extend the default Conveyor benchmark scale sweep from `1.0-1.4` to `1.0-1.5`.
+- Keep the primary comparison fixed to:
+  - `base` with `WINNING_HYPERPARAMS`
+  - `controlnet_bestval_v2` using paper-default guidance from `mmd/config/mmd_params.py`
+- Keep `control_scale=1.0` fixed for this run so the new `scale=1.5` slice isolates environment difficulty rather than introducing a second ablation axis.
+
+### Reporting Changes
+
+- Surface `avg_data_adherence` directly in the terminal summary printed from `launch_controlnet_evaluation.py`.
+- After each scale finishes, print a cross-agent-count summary line that averages `avg_data_adherence` across agent counts (`6`, `9`, `12`, `15`).
+- Preserve the existing CSV behavior where data-adherence metrics remain `0.0` when a run has zero successful trials, so the new `scale=1.5` failure boundary can be reported cleanly.
+
+### Execution Workflow
+
+- Use `launch_controlnet_benchmark.py` as the orchestration entry point.
+- Add `--num_workers` so the benchmark matrix can be sharded by `(env_scale, mode)` pair across multiple shell scripts.
+- Assign one GPU per worker and launch the generated worker scripts in separate tmux windows.
+- This keeps each worker responsible for a complete `(scale, mode)` slice while reusing the existing `launch_controlnet_evaluation.py -> run_multi_agent_experiment()` flow without changing experiment semantics.
+
+### Experimental Intent
+
+The `scale=1.5` slice is the first targeted stress-test beyond the currently completed benchmark range. The goal is not only to measure success rate, CT expansions, and planning time, but also to check whether successful trajectories still follow the corridor structure captured by `cost_data(tau^i)` as congestion increases.
+
+If ControlNet gains persist at `1.5`, that strengthens the case that the current global FiLM-style conditioning remains effective near the practical boundary. If both methods degrade sharply, the result provides a concrete trigger for the next architecture iteration proposed in Section 18, especially stronger spatial conditioning such as cross-attention.
+
+---
+
+## 20. Scale 1.5 Stress-Test Results
+
+This section reports the executed `env_scale=1.5` benchmark from Section 19. Both runs used `--seed 18`, so start/goal configurations were matched across the base and ControlNet evaluations.
+
+### Run Metadata
+
+| Field | `controlnet_bestval_v2` | `base` |
+|-------|-------------------------|--------|
+| Run ID | `2026-03-14-17-24-27-561499-pid1929600` | `2026-03-14-17-25-33-254288-pid1930758` |
+| Model / checkpoint | `controlnet_epoch_0333_iter_030000_state_dict.pth` | base diffusion model |
+| Hyperparameter policy | defaults from `mmd/config/mmd_params.py` | `WINNING_HYPERPARAMS` |
+| `control_scale` | `1.0` | N/A |
+| Seed | `18` | `18` |
+| Agent counts | `6, 9, 12, 15` | `6, 9, 12, 15` |
+| Trials per agent count | `10` | `10` |
+| `env_scale` | `1.5` | `1.5` |
+
+### Side-by-Side Results
+
+#### `controlnet_bestval_v2`
+
+| Agents | Success Rate | CT Expansions | Planning Time (s) | Data Adherence | Path Length | Acceleration | Fail Mode |
+|--------|--------------|---------------|-------------------|----------------|-------------|--------------|-----------|
+| 6 | 1.0 | 1.6 | 9.09 | 0.950 | 3.804 | 0.134 | - |
+| 9 | 1.0 | 4.1 | 14.81 | 0.933 | 3.862 | 0.148 | - |
+| 12 | 0.9 | 5.67 | 20.15 | 0.917 | 3.802 | 0.148 | `no_solution=0.1` |
+| 15 | 0.9 | 15.0 | 32.93 | 0.926 | 3.951 | 0.169 | `no_solution=0.1` |
+
+#### `base`
+
+| Agents | Success Rate | CT Expansions | Planning Time (s) | Data Adherence | Path Length | Acceleration | Fail Mode |
+|--------|--------------|---------------|-------------------|----------------|-------------|--------------|-----------|
+| 6 | 1.0 | 2.0 | 6.67 | 0.967 | 3.837 | 0.129 | - |
+| 9 | 1.0 | 9.4 | 16.17 | 0.956 | 4.136 | 0.172 | - |
+| 12 | 0.9 | 16.0 | 25.62 | 0.944 | 4.257 | 0.193 | `no_solution=0.1` |
+| 15 | 0.9 | 52.0 | 67.37 | 0.985 | 4.809 | 0.251 | `runtime_limit=0.1` |
+
+### Extended 15-Agent Tables (Scales 1.0 to 1.5)
+
+These extend the primary comparison from Section 17 by adding the `env_scale=1.5` row.
+
+#### 15-Agent CT Expansions by Scale
+
+| Scale | `base` | `controlnet_bestval_v2` |
+|-------|--------|-------------------------|
+| 1.0 | 18.8 | 9.2 |
+| 1.1 | 15.1 | 9.0 |
+| 1.2 | 14.6 | 10.3 |
+| 1.3 | 26.4 | 10.3 |
+| 1.4 | 31.1 | 10.7 |
+| 1.5 | 52.0 | 15.0 |
+
+At `env_scale=1.5`, ControlNet reduces 15-agent CT expansions by `71.2%` (`52.0 -> 15.0`), which is the largest relative reduction observed in the current sweep.
+
+#### 15-Agent Planning Time by Scale (seconds)
+
+| Scale | `base` | `controlnet_bestval_v2` |
+|-------|--------|-------------------------|
+| 1.0 | 56.57 | 42.45 |
+| 1.1 | 50.35 | 42.20 |
+| 1.2 | 47.83 | 44.90 |
+| 1.3 | 66.78 | 44.17 |
+| 1.4 | 72.63 | 44.83 |
+| 1.5 | 67.37 | 32.93 |
+
+At `env_scale=1.5`, ControlNet reduces 15-agent planning time by `51.1%` (`67.37s -> 32.93s`).
+
+### Updated Cross-Scale Means (Primary Comparison Pair)
+
+The `1.0-1.4` rows are copied from Section 17. The `1.0-1.5` rows add the new `env_scale=1.5` slice, giving `24` scale/agent-count combinations per mode.
+
+| Mode | Mean Success | Mean CT Expansions | Mean Planning Time (s) | Mean Path Length/Agent | Mean Acceleration/Agent | Mean Runtime-Limit Fail Rate |
+|------|--------------|--------------------|------------------------|------------------------|-------------------------|------------------------------|
+| `base` (`1.0-1.4`) | 0.995 | 9.26 | 30.22 | 3.680 | 0.146 | 0.005 |
+| `base` (`1.0-1.5`) | 0.988 | 11.03 | 30.01 | 3.777 | 0.153 | 0.008 |
+| `controlnet_bestval_v2` (`1.0-1.4`) | 1.000 | 4.84 | 27.14 | 3.502 | 0.134 | 0.000 |
+| `controlnet_bestval_v2` (`1.0-1.5`) | 0.992 | 5.13 | 25.82 | 3.561 | 0.137 | 0.000 |
+
+The main cross-scale effect is that the CT-expansion gap widens further when `env_scale=1.5` is included: ControlNet moves from `47.7%` lower mean CT expansions than base (`4.84` vs `9.26`) to `53.5%` lower (`5.13` vs `11.03`).
+
+### Analysis
+
+#### 1. Scale 1.5 Is Not a Failure Boundary
+
+The Section 19 stress test was intended to locate the current failure boundary. It does not do that. Both methods still achieve `90-100%` success across all agent counts, with only one failed trial at `12` agents and one failed trial at `15` agents for each mode.
+
+This means the practical boundary lies beyond `env_scale=1.5`.
+
+#### 2. ControlNet Advantage Grows with Scale
+
+The 15-agent CT-expansion trend shows that the ControlNet benefit grows as the environment gets harder:
+
+| Scale | `base` CT | `controlnet_bestval_v2` CT | Reduction |
+|-------|-----------|----------------------------|-----------|
+| 1.0 | 18.8 | 9.2 | 51.1% |
+| 1.2 | 14.6 | 10.3 | 29.5% |
+| 1.4 | 31.1 | 10.7 | 65.6% |
+| 1.5 | 52.0 | 15.0 | 71.2% |
+
+The base model's CT expansions grow much faster than ControlNet's as scale increases. This is the clearest sign that SDF conditioning keeps the generated trajectories closer to what CBS can resolve efficiently.
+
+#### 3. Planning Time Flips from Overhead to Payoff
+
+At `6` agents, the base model is faster (`6.67s` vs `9.09s`), which is consistent with the extra SDF-encoder forward pass adding fixed overhead on easy instances.
+
+By `15` agents, that overhead is dominated by CBS savings: ControlNet is `51.1%` faster (`32.93s` vs `67.37s`). The gain appears as soon as the search problem becomes difficult enough for CT expansions to dominate runtime.
+
+#### 4. Path Quality Improves at the Hardest Slice
+
+At `15` agents, ControlNet also improves the successful trajectories themselves:
+
+- path length: `3.951` vs `4.809` (`17.8%` shorter)
+- acceleration: `0.169` vs `0.251` (`32.7%` lower)
+
+So the higher-scale benefit is not limited to search effort. The trajectories are also shorter and smoother.
+
+#### 5. Data Adherence Remains High for Both Modes
+
+The new reporting path added in Section 19 shows that both methods remain well aligned with the conveyor corridor structure at `env_scale=1.5`:
+
+- `controlnet_bestval_v2`: `0.917-0.950` across agent counts (mean `0.932`)
+- `base`: `0.944-0.985` across agent counts (mean `0.963`)
+
+Base is slightly higher on this metric, especially at `15` agents, but both methods remain comfortably above `0.9`. The successful trajectories therefore still follow the intended data geometry even under the added congestion.
+
+#### 6. Failure Modes Separate at 15 Agents
+
+At `12` agents, both modes have one `no_solution` failure. At `15` agents, the failure modes diverge:
+
+- `base`: `runtime_limit=0.1`
+- `controlnet_bestval_v2`: `no_solution=0.1`
+
+This suggests two different bottlenecks. The base model primarily struggles because CBS search grows too large, while ControlNet primarily struggles when a small subset of generated trajectories still leads to an unresolved conflict pattern.
+
+### Revised Next Steps
+
+1. Keep `controlnet_bestval_v2` as the default inference checkpoint for Conveyor scaled experiments.
+2. Treat `env_scale=1.5` as completed, not as the failure boundary.
+3. Run the planned `control_scale` ablation (`0.5`, `1.0`, `1.5`) to check whether the remaining `no_solution` failures can be reduced without giving up the CT-expansion gains.
+4. Extend the benchmark to `env_scale=1.6` or `1.7` before investing in Approach A (cross-attention conditioning).
+5. Investigate the `no_solution` failure mode at high scale/high agent count as the most likely near-term improvement target.
