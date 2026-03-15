@@ -65,7 +65,7 @@ class EnvHighways2D(EnvBase):
                     [-0.875, -0.875],
                 ]),
                 np.array([
-                    [0.5  * scale, 0.5  * scale],
+                    [0.5, 0.5],
                     [0.5, 0.25],
                     [0.5, 0.25],
                     [0.25, 0.5],
@@ -74,7 +74,7 @@ class EnvHighways2D(EnvBase):
                     [0.25, 0.25],
                     [0.25, 0.25],
                     [0.25, 0.25]
-                ]),
+                ]) * scale,
                 tensor_args=tensor_args
             ),
         ]
@@ -282,7 +282,7 @@ if __name__ == '__main__':
     mmd_root = Path(__file__).resolve().parents[4]  # Navigate to /home/.../mmd/
     output_dir = mmd_root / 'media'
     output_dir.mkdir(exist_ok=True)
-    scale = 1.75
+    scale = 1.5
     env = EnvHighways2D(
         precompute_sdf_obj_fixed=True,
         sdf_cell_size=0.01,

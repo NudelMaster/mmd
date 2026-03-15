@@ -23,6 +23,8 @@ SOFTWARE.
 """
 
 import argparse
+import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -124,6 +126,12 @@ def parse_args():
         help='Uniform ControlNet residual scale at inference (default: 1.0)',
     )
     parser.add_argument(
+        '--run_label',
+        type=str,
+        default=None,
+        help='Optional label written to run_metadata.json so timestamped result folders are easy to identify',
+    )
+    parser.add_argument(
         '--no_render_animation',
         action='store_true',
         help='Disable GIF rendering and only save the static image per successful trial',
@@ -204,6 +212,7 @@ def print_run_header(evaluation_id, mode, env_scale, args, hyperparam_overrides)
     print('CONTROLNET EVALUATION RUN')
     print('=' * 80)
     print(f'Evaluation id: {evaluation_id}')
+    print(f'Run label: {get_run_label(args, mode)}')
     print(f'Mode: {mode}')
     print(f'Instance: {args.instance_name}')
     print(f'Env scale: {env_scale}')
@@ -220,15 +229,63 @@ def print_run_header(evaluation_id, mode, env_scale, args, hyperparam_overrides)
     print('=' * 80 + '\n')
 
 
-def print_results_summary(results_dir, mode, env_scale):
-    csv_path = results_dir / 'aggregated_results_all_agents.csv'
-    print(f'Results dir: {results_dir}')
+def get_run_label(args, mode):
+    if args.run_label is not None:
+        return args.run_label
 
+    if mode == 'base':
+        return 'base'
+
+    checkpoint_stem = Path(args.controlnet_checkpoint_path).stem
+    if checkpoint_stem.startswith('ema_'):
+        return 'controlnet_ema'
+    return f'controlnet_{checkpoint_stem}'
+
+
+def write_run_metadata(results_dir, evaluation_id, mode, env_scale, args, hyperparam_overrides):
+    metadata = {
+        'metadata_version': 1,
+        'evaluation_id': evaluation_id,
+        'time_str': results_dir.parent.name,
+        'run_label': get_run_label(args, mode),
+        'mode': mode,
+        'instance_name': args.instance_name,
+        'env_scale': env_scale,
+        'num_agents': list(args.num_agents),
+        'num_trials_per_combination': args.num_trials_per_combination,
+        'multi_agent_planner_classes': list(args.multi_agent_planner_classes),
+        'runtime_limit': args.runtime_limit,
+        'stagger_start_time_dt': args.stagger_start_time_dt,
+        'seed': args.seed,
+        'render_animation': not args.no_render_animation,
+        'results_dir': str(results_dir),
+        'controlnet_checkpoint_path': args.controlnet_checkpoint_path if mode == 'controlnet' else None,
+        'sdf_cache_dir': args.sdf_cache_dir if mode == 'controlnet' else None,
+        'control_scale': args.control_scale if mode == 'controlnet' else None,
+        'hyperparam_overrides': hyperparam_overrides,
+        'cli_args': vars(args),
+        'argv': sys.argv,
+    }
+    metadata_path = results_dir / 'run_metadata.json'
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='ascii')
+    print(f'Wrote run metadata: {metadata_path}')
+
+
+def load_aggregated_results_df(results_dir):
+    csv_path = results_dir / 'aggregated_results_all_agents.csv'
     if not csv_path.exists():
         print(f'Aggregated summary not found: {csv_path}')
-        return
+        return None
 
-    df = pd.read_csv(csv_path)
+    return pd.read_csv(csv_path)
+
+
+def print_results_summary(results_dir, mode, env_scale):
+    print(f'Results dir: {results_dir}')
+    df = load_aggregated_results_df(results_dir)
+    if df is None:
+        return None
+
     summary_columns = [
         'method',
         'num_agents',
@@ -236,12 +293,14 @@ def print_results_summary(results_dir, mode, env_scale):
         'avg_planning_time',
         'avg_ct_expansions',
         'avg_num_collisions_in_solution',
+        'avg_data_adherence',
         'env_scale',
     ]
     summary_columns = [column for column in summary_columns if column in df.columns]
 
     print(f'Aggregated summary for mode={mode}, env_scale={env_scale}:')
     print(df[summary_columns].to_string(index=False))
+    return df
 
 
 def main():
@@ -260,6 +319,7 @@ def main():
     print('=' * 80 + '\n')
 
     for env_scale in args.scales:
+        scale_data_adherence_summary_l = []
         for mode in args.modes:
             fix_random_seed(args.seed)
             print_run_header(evaluation_id, mode, env_scale, args, hyperparam_overrides)
@@ -268,20 +328,32 @@ def main():
             run_multi_agent_experiment(experiment_config)
 
             results_dir = Path(get_results_dir_from_experiment_config(experiment_config))
+            write_run_metadata(results_dir, evaluation_id, mode, env_scale, args, hyperparam_overrides)
             run_records.append({
+                'run_label': get_run_label(args, mode),
                 'mode': mode,
                 'env_scale': env_scale,
                 'time_str': experiment_config.time_str,
                 'results_dir': results_dir,
             })
-            print_results_summary(results_dir, mode, env_scale)
+            aggregated_results_df = print_results_summary(results_dir, mode, env_scale)
+
+            if aggregated_results_df is not None and 'avg_data_adherence' in aggregated_results_df.columns:
+                avg_data_adherence = float(aggregated_results_df['avg_data_adherence'].fillna(0.0).mean())
+                scale_data_adherence_summary_l.append((get_run_label(args, mode), avg_data_adherence))
+
+        if scale_data_adherence_summary_l:
+            summary_str = ', '.join(
+                [f'{run_label}={avg_data_adherence:.4f}' for run_label, avg_data_adherence in scale_data_adherence_summary_l]
+            )
+            print(f'Cross-agent avg_data_adherence for env_scale={env_scale}: {summary_str}')
 
     print('\n' + '=' * 80)
     print('EVALUATION RUNS COMPLETE')
     print('=' * 80)
     for run_record in run_records:
         print(
-            f"mode={run_record['mode']}, env_scale={run_record['env_scale']}, "
+            f"run_label={run_record['run_label']}, mode={run_record['mode']}, env_scale={run_record['env_scale']}, "
             f"time_str={run_record['time_str']}, results_dir={run_record['results_dir']}"
         )
     print('=' * 80 + '\n')
