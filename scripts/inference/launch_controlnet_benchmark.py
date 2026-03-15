@@ -168,6 +168,11 @@ def parse_args():
         help='Generate ControlNet-only scripts (skip base mode command generation)',
     )
     parser.add_argument(
+        '--skip_ema',
+        action='store_true',
+        help='Do not generate EMA checkpoint commands; keep only best-val ControlNet commands',
+    )
+    parser.add_argument(
         '--controlnet_use_paper_defaults',
         action='store_true',
         help=(
@@ -351,18 +356,19 @@ def build_worker_mode_commands(
                 )
             )
 
-        labeled_commands.append(
-            (
-                build_worker_command_label(ema_run_label, scale),
-                build_controlnet_command(
-                    args,
-                    args.ema_checkpoint_path,
-                    ema_run_label,
-                    hyperparam_overrides=controlnet_hyperparam_overrides,
-                    scales_override=[scale],
-                ),
+        if not args.skip_ema:
+            labeled_commands.append(
+                (
+                    build_worker_command_label(ema_run_label, scale),
+                    build_controlnet_command(
+                        args,
+                        args.ema_checkpoint_path,
+                        ema_run_label,
+                        hyperparam_overrides=controlnet_hyperparam_overrides,
+                        scales_override=[scale],
+                    ),
+                )
             )
-        )
         labeled_commands.append(
             (
                 build_worker_command_label(bestval_run_label, scale),
@@ -523,8 +529,9 @@ def build_manifest(
         worker_gpu_ids,
 ):
     trials_per_mode = len(args.scales) * len(args.num_agents) * args.num_trials_per_combination
+    num_controlnet_variants = 1 if args.skip_ema else 2
     total_base_trials = 0 if args.skip_base else trials_per_mode
-    total_controlnet_trials = trials_per_mode * 2
+    total_controlnet_trials = trials_per_mode * num_controlnet_variants
     total_trials = total_base_trials + total_controlnet_trials
 
     lines = [
@@ -540,6 +547,7 @@ def build_manifest(
         f'Render animation: {args.render_animation}',
         f'Control scale: {args.control_scale}',
         f'Skip base mode: {args.skip_base}',
+        f'Skip EMA checkpoint: {args.skip_ema}',
         f'Num workers: {args.num_workers}',
         f'Worker GPU ids: {worker_gpu_ids}',
         '',
@@ -634,6 +642,7 @@ def print_summary(
     print(f'Render animation: {args.render_animation}')
     print(f'Control scale: {args.control_scale}')
     print(f'Skip base mode: {args.skip_base}')
+    print(f'Skip EMA checkpoint: {args.skip_ema}')
     print(f'Num workers: {args.num_workers}')
     print(f'Worker GPU ids: {worker_gpu_ids}')
     print('Winning hyperparameters:')
@@ -715,12 +724,14 @@ def main():
         base_script_path = output_dir / 'controlnet_benchmark_gpu0.sh'
         controlnet_script_path = output_dir / 'controlnet_benchmark_gpu1.sh'
 
-        controlnet_ema_command = build_controlnet_command(
-            args,
-            args.ema_checkpoint_path,
-            ema_run_label,
-            hyperparam_overrides=controlnet_hyperparam_overrides,
-        )
+        controlnet_ema_command = None
+        if not args.skip_ema:
+            controlnet_ema_command = build_controlnet_command(
+                args,
+                args.ema_checkpoint_path,
+                ema_run_label,
+                hyperparam_overrides=controlnet_hyperparam_overrides,
+            )
         controlnet_bestval_command = build_controlnet_command(
             args,
             args.bestval_checkpoint_path,
@@ -730,42 +741,59 @@ def main():
 
         tmux_session_specs = []
         if args.skip_base:
-            script_specs = [
-                (base_script_path, args.base_gpu, [(ema_run_label, controlnet_ema_command)]),
-                (controlnet_script_path, args.controlnet_gpu, [(bestval_run_label, controlnet_bestval_command)]),
-            ]
-            labeled_commands = [
-                (ema_run_label, controlnet_ema_command),
-                (bestval_run_label, controlnet_bestval_command),
-            ]
-            tmux_session_specs = [
-                ('controlnet_ema', f'{args.tmux_session_prefix}_ema_gpu{args.base_gpu}', base_script_path),
-                (
-                    'controlnet_bestval',
-                    f'{args.tmux_session_prefix}_bestval_gpu{args.controlnet_gpu}',
-                    controlnet_script_path,
-                ),
-            ]
+            if args.skip_ema:
+                script_specs = [
+                    (controlnet_script_path, args.controlnet_gpu, [(bestval_run_label, controlnet_bestval_command)]),
+                ]
+                labeled_commands = [
+                    (bestval_run_label, controlnet_bestval_command),
+                ]
+                tmux_session_specs = [
+                    (
+                        'controlnet_bestval',
+                        f'{args.tmux_session_prefix}_bestval_gpu{args.controlnet_gpu}',
+                        controlnet_script_path,
+                    ),
+                ]
+            else:
+                script_specs = [
+                    (base_script_path, args.base_gpu, [(ema_run_label, controlnet_ema_command)]),
+                    (controlnet_script_path, args.controlnet_gpu, [(bestval_run_label, controlnet_bestval_command)]),
+                ]
+                labeled_commands = [
+                    (ema_run_label, controlnet_ema_command),
+                    (bestval_run_label, controlnet_bestval_command),
+                ]
+                tmux_session_specs = [
+                    ('controlnet_ema', f'{args.tmux_session_prefix}_ema_gpu{args.base_gpu}', base_script_path),
+                    (
+                        'controlnet_bestval',
+                        f'{args.tmux_session_prefix}_bestval_gpu{args.controlnet_gpu}',
+                        controlnet_script_path,
+                    ),
+                ]
         else:
             base_command = build_base_command(args, 'base')
+            controlnet_commands = [(bestval_run_label, controlnet_bestval_command)]
+            if not args.skip_ema:
+                controlnet_commands.insert(0, (ema_run_label, controlnet_ema_command))
+
             script_specs = [
                 (base_script_path, args.base_gpu, [('base', base_command)]),
                 (
                     controlnet_script_path,
                     args.controlnet_gpu,
-                    [(ema_run_label, controlnet_ema_command), (bestval_run_label, controlnet_bestval_command)],
+                    controlnet_commands,
                 ),
             ]
-            labeled_commands = [
-                ('base', base_command),
-                (ema_run_label, controlnet_ema_command),
-                (bestval_run_label, controlnet_bestval_command),
-            ]
+            labeled_commands = [('base', base_command)] + controlnet_commands
+            controlnet_session_label = 'controlnet_bestval' if args.skip_ema else 'controlnet'
+            tmux_session_suffix = 'bestval' if args.skip_ema else 'controlnet'
             tmux_session_specs = [
                 ('base', f'{args.tmux_session_prefix}_base_gpu{args.base_gpu}', base_script_path),
                 (
-                    'controlnet',
-                    f'{args.tmux_session_prefix}_controlnet_gpu{args.controlnet_gpu}',
+                    controlnet_session_label,
+                    f'{args.tmux_session_prefix}_{tmux_session_suffix}_gpu{args.controlnet_gpu}',
                     controlnet_script_path,
                 ),
             ]
