@@ -893,6 +893,80 @@ This suggests two different bottlenecks. The base model primarily struggles beca
 
 1. Keep `controlnet_bestval_v2` as the default inference checkpoint for Conveyor scaled experiments.
 2. Treat `env_scale=1.5` as completed, not as the failure boundary.
-3. Run the planned `control_scale` ablation (`0.5`, `1.0`, `1.5`) to check whether the remaining `no_solution` failures can be reduced without giving up the CT-expansion gains.
+3. ~~Run the planned `control_scale` ablation (`0.5`, `1.0`, `1.5`) to check whether the remaining `no_solution` failures can be reduced without giving up the CT-expansion gains.~~ Completed; see Section 8.
 4. Extend the benchmark to `env_scale=1.6` or `1.7` before investing in Approach A (cross-attention conditioning).
 5. Investigate the `no_solution` failure mode at high scale/high agent count as the most likely near-term improvement target.
+
+---
+
+## 8. Control-Scale Ablation Results
+
+This section documents the completed `control_scale` ablation proposed at the end of Section 7. The goal was to test whether changing ControlNet residual strength can remove the remaining `no_solution` failures at `env_scale=1.5`, especially for `12` and `15` agents.
+
+### Protocol
+
+- checkpoint fixed to `controlnet_epoch_0333_iter_030000_state_dict.pth`
+- guidance fixed to the paper defaults from `mmd/config/mmd_params.py`
+- scales: `1.0, 1.1, 1.2, 1.3, 1.4, 1.5`
+- agent counts: `6, 9, 12, 15`
+- trials per combination: `10`
+- seed: `18`
+- compared strengths: `control_scale = 0.5, 1.0, 1.5`
+
+The `control_scale=1.0` reference reuses the completed `controlnet_bestval_v2` results from Sections 3 and 7. The new ablation launches added only the `0.5` and `1.5` variants.
+
+### Run Mapping
+
+| Run label | `control_scale` | Folders | Scales covered | Source |
+|-----------|-----------------|---------|----------------|--------|
+| `controlnet_bestval_v2_cs050` | `0.5` | `6` | `1.0..1.5` | new ablation run |
+| `controlnet_bestval_v2` | `1.0` | `6` | `1.0..1.5` | existing reference from Sections 3 and 7 |
+| `controlnet_bestval_v2_cs150` | `1.5` | `6` | `1.0..1.5` | new ablation run |
+
+### Cross-Scale Means (All 24 combinations per control scale)
+
+| Run label | `control_scale` | Mean Success | Mean CT Expansions | Mean Planning Time (s) | Mean Data Adherence | Mean Path Length/Agent | Mean Acceleration/Agent | Mean `no_solution` Rate |
+|-----------|-----------------|--------------|--------------------|------------------------|---------------------|------------------------|-------------------------|-------------------------|
+| `controlnet_bestval_v2_cs050` | `0.5` | 0.971 | 6.04 | 21.28 | 0.945 | 3.532 | 0.133 | 0.029 |
+| `controlnet_bestval_v2` | `1.0` | 0.992 | 5.13 | 25.82 | 0.932 | 3.561 | 0.137 | 0.008 |
+| `controlnet_bestval_v2_cs150` | `1.5` | 0.992 | 4.59 | 19.55 | 0.933 | 3.692 | 0.146 | 0.008 |
+
+All observed ControlNet ablation failures remain `no_solution` failures. No `runtime_limit` failures appear in any of the three ControlNet-strength variants.
+
+### Scale 1.5 Breakdown by Agent Count
+
+Each cell is listed as `control_scale=0.5 / 1.0 / 1.5`.
+
+| Agents | Success | CT Expansions | Planning Time (s) | Data Adherence | Path Length | Acceleration | Fail Mode |
+|--------|---------|---------------|-------------------|----------------|-------------|--------------|-----------|
+| 6 | 1.0 / 1.0 / 1.0 | 1.60 / 1.60 / 1.40 | 9.12 / 9.09 / 9.04 | 0.967 / 0.950 / 0.917 | 3.712 / 3.804 / 3.997 | 0.129 / 0.134 / 0.147 | - / - / - |
+| 9 | 1.0 / 1.0 / 1.0 | 4.40 / 4.10 / 3.40 | 15.36 / 14.81 / 14.51 | 0.956 / 0.933 / 0.933 | 3.834 / 3.862 / 3.974 | 0.144 / 0.148 / 0.157 | - / - / - |
+| 12 | 0.9 / 0.9 / 1.0 | 9.67 / 5.67 / 6.00 | 24.31 / 20.15 / 21.57 | 0.926 / 0.917 / 0.942 | 3.999 / 3.802 / 4.031 | 0.164 / 0.148 / 0.164 | no_solution=0.1 / no_solution=0.1 / - |
+| 15 | 0.8 / 0.9 / 1.0 | 22.75 / 15.00 / 14.50 | 41.52 / 32.93 / 35.16 | 0.958 / 0.926 / 0.920 | 4.183 / 3.951 / 4.093 | 0.192 / 0.169 / 0.188 | no_solution=0.2 / no_solution=0.1 / - |
+
+### 15-Agent Comparison by Scale
+
+Each cell is listed as `control_scale=0.5 / 1.0 / 1.5`.
+
+| Scale | Success | CT Expansions | Planning Time (s) | Data Adherence | Fail Mode |
+|-------|---------|---------------|-------------------|----------------|-----------|
+| 1.0 | 1.0 / 1.0 / 0.9 | 9.10 / 9.20 / 6.89 | 33.27 / 42.45 / 30.06 | 0.953 / 0.947 / 0.956 | - / - / no_solution=0.1 |
+| 1.1 | 1.0 / 1.0 / 1.0 | 9.40 / 9.00 / 7.30 | 33.03 / 42.20 / 30.65 | 0.967 / 0.947 / 0.987 | - / - / - |
+| 1.2 | 1.0 / 1.0 / 1.0 | 10.60 / 10.30 / 7.70 | 34.10 / 44.90 / 31.98 | 0.953 / 0.960 / 0.967 | - / - / - |
+| 1.3 | 0.9 / 1.0 / 1.0 | 11.78 / 10.30 / 8.60 | 35.98 / 44.17 / 31.33 | 0.963 / 0.960 / 0.920 | no_solution=0.1 / - / - |
+| 1.4 | 0.9 / 1.0 / 1.0 | 16.78 / 10.70 / 12.50 | 37.77 / 44.83 / 33.35 | 0.948 / 0.953 / 0.933 | no_solution=0.1 / - / - |
+| 1.5 | 0.8 / 0.9 / 1.0 | 22.75 / 15.00 / 14.50 | 41.52 / 32.93 / 35.16 | 0.958 / 0.926 / 0.920 | no_solution=0.2 / no_solution=0.1 / - |
+
+### What the Ablation Shows
+
+1. Lowering ControlNet strength to `0.5` does **not** help. It is the weakest setting overall: mean success drops to `0.971`, mean `no_solution` rate rises to `0.029`, and the motivating `env_scale=1.5` slice gets worse rather than better.
+2. Raising ControlNet strength to `1.5` removes the specific `env_scale=1.5` failures that motivated the ablation. At `12` agents, success improves from `0.9` to `1.0`; at `15` agents, success improves from `0.9` to `1.0` and `no_solution` disappears completely.
+3. The `1.5` setting is **not** a strict global winner. It introduces isolated `no_solution=0.1` failures at `scale=1.0, agents=15` and `scale=1.1, agents=12`, so its mean success ties `control_scale=1.0` rather than clearly exceeding it.
+4. At the hardest `scale=1.5` slice, the main gain from `control_scale=1.5` is robustness, not speed. Relative to `1.0`, CT expansions improve slightly at `15` agents (`15.0 -> 14.5`), but planning time is slightly worse (`32.93s -> 35.16s`) and successful trajectories are longer and less smooth.
+5. The original "loosen the bundle" hypothesis is therefore not supported. If the immediate objective is to remove the remaining `no_solution` failures at `env_scale=1.5`, increasing control strength helps more than decreasing it.
+
+### Updated Recommendation
+
+- keep `controlnet_bestval_v2` with `control_scale=1.0` as the safer balanced default across the full `1.0-1.5` sweep
+- treat `control_scale=1.5` as the preferred stress-test variant when the main objective is success at `env_scale=1.5`
+- next step: extend the same comparison to `env_scale=1.6` or `1.7` to see whether the `1.5` setting continues to help beyond the current stress-test boundary
