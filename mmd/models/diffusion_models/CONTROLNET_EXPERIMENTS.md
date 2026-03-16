@@ -970,3 +970,137 @@ Each cell is listed as `control_scale=0.5 / 1.0 / 1.5`.
 - keep `controlnet_bestval_v2` with `control_scale=1.0` as the safer balanced default across the full `1.0-1.5` sweep
 - treat `control_scale=1.5` as the preferred stress-test variant when the main objective is success at `env_scale=1.5`
 - next step: extend the same comparison to `env_scale=1.6` or `1.7` to see whether the `1.5` setting continues to help beyond the current stress-test boundary
+
+---
+
+## 9. Metric Definitions and Aggregation Rules
+
+This section explains how the metrics reported throughout this document are computed in the current inference pipeline.
+
+### Aggregation Levels
+
+The reporting pipeline has three levels:
+
+1. **Per-trial metrics** are computed for one MAPF attempt.
+2. **Per-row aggregated metrics** in `aggregated_results_all_agents.csv` summarize one fixed `(env_scale, num_agents, planner)` slice across all trials for that slice.
+3. **Cross-scale means** reported in this document are simple arithmetic means of those aggregated CSV rows across the included `(env_scale, num_agents)` combinations.
+
+Unless stated otherwise, tables in this document use the per-row aggregated values from `aggregated_results_all_agents.csv`.
+
+### Trial Outcome Categories
+
+Each trial ends in exactly one of these statuses:
+
+- `SUCCESS`
+- `FAIL_RUNTIME_LIMIT`
+- `FAIL_NO_SOLUTION`
+- `FAIL_COLLISION_AGENTS`
+
+The success and fail-rate metrics are computed from these discrete outcome labels.
+
+### Metrics Normalized by Total Number of Trials
+
+For a fixed `(env_scale, num_agents, planner)` slice with `N` total trials:
+
+- `success_rate`
+  - fraction of trials whose final status is `SUCCESS`
+  - formula: `#SUCCESS / N`
+- `fail_rate_runtime_limit`
+  - formula: `#FAIL_RUNTIME_LIMIT / N`
+- `fail_rate_no_solution`
+  - formula: `#FAIL_NO_SOLUTION / N`
+- `fail_rate_collision_agents`
+  - formula: `#FAIL_COLLISION_AGENTS / N`
+
+These rates therefore sum to `1.0` up to floating-point rounding.
+
+### Metrics Normalized by Number of Successful Trials
+
+Let `S` be the number of successful trials in the same slice.
+
+The following metrics are accumulated only over successful trials and then divided by `S`:
+
+- `avg_ct_expansions`
+  - mean number of conflict-tree nodes expanded by the multi-agent planner
+- `avg_planning_time`
+  - mean wall-clock planning time in seconds
+- `avg_data_adherence`
+  - mean trajectory adherence score
+- `avg_path_length_per_agent`
+  - mean path length, after first averaging over agents within each successful trial
+- `avg_mean_path_acceleration_per_agent`
+  - mean path acceleration, after first averaging over agents within each successful trial
+
+If `S = 0`, these fields remain `0.0` in the aggregated CSV. This is why fully failed slices can show `0.0` for path-quality or adherence metrics.
+
+### `avg_num_collisions_in_solution`
+
+`avg_num_collisions_in_solution` is a special case in the current implementation:
+
+- per trial, `num_collisions_in_solution` starts from the planner-reported collision count in the returned solution
+- if a supposedly successful solution still contains agent-agent collisions under the post-check, those collisions are added and the trial status is changed to `FAIL_COLLISION_AGENTS`
+- during aggregation, the metric is accumulated only from trials whose final status is `SUCCESS`
+- the final sum is then divided by the total number of trials `N`
+
+So this field is best interpreted as a sanity-check metric. In the successful MAPF runs reported here it is usually `0.0`.
+
+### Trial-Level Path Metrics
+
+For one successful trial with `A` agents:
+
+- `path_length_per_agent`
+  - compute each agent's 2D path length from the returned position trajectory
+  - average those `A` path lengths across agents
+- `mean_path_acceleration_per_agent`
+  - compute each agent's average acceleration from its position/velocity trajectory
+  - average those `A` per-agent accelerations across agents
+
+This means the aggregated CSV already stores an agent-averaged value at the trial level before averaging across successful trials.
+
+### Trial-Level `data_adherence`
+
+`data_adherence` is environment-defined. For the Conveyor environments used in this document:
+
+- each trajectory segment is scored against the conveyor corridor structure
+- in `EnvConveyor2D`, a segment receives `1` if it traverses a full valid corridor pattern (top corridor right-to-left or bottom corridor left-to-right) and `0` otherwise
+- if an agent trajectory spans multiple skeleton tiles, its adherence is the mean of the per-tile adherence scores
+- the trial-level `data_adherence` is then the mean of those per-agent adherence values across all agents
+
+Because of that averaging, `avg_data_adherence` can take any value in `[0, 1]`, not just binary values.
+
+### Cross-Scale Means Used in This Document
+
+When this document reports values such as:
+
+- "mean success"
+- "mean CT expansions"
+- "updated cross-scale means"
+
+the computation is a simple arithmetic mean over the relevant aggregated CSV rows. For example:
+
+- the `1.0-1.5` cross-scale means average the `24` rows coming from `6` scales x `4` agent counts
+- the `1.0-1.4` means average `20` rows
+
+These are means over experiment slices, not means over individual trials pooled together globally.
+
+### Percentage Improvements Reported in the Text
+
+Whenever the document states that one method reduces a metric by some percentage, the calculation is:
+
+- `reduction = (reference - variant) / reference`
+
+For example, a CT-expansion reduction from `52.0` to `15.0` is reported as:
+
+- `(52.0 - 15.0) / 52.0 = 71.2%`
+
+The same convention is used for planning-time reductions and similar comparisons.
+
+### Cross-Agent `avg_data_adherence` Summary Lines
+
+The console summary printed after each scale in `launch_controlnet_evaluation.py` reports a cross-agent `avg_data_adherence` value by:
+
+- reading the `avg_data_adherence` column from `aggregated_results_all_agents.csv`
+- filling any missing values with `0.0`
+- averaging across the four agent-count rows for that scale
+
+This summary is only a convenience printout. The primary source of truth for analysis remains the per-row aggregated CSV values used throughout this document.
